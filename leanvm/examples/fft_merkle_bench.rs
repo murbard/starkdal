@@ -50,6 +50,7 @@ fn pick_log_felts_per_leaf_kb(log_total: usize) -> usize {
 
 // ── Precomputed tables (single source of truth) ───────────────────────────
 
+#[allow(dead_code)]
 struct CircuitParams {
     log_n: usize,
     log_blowup: usize,
