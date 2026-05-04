@@ -1,0 +1,300 @@
+//! VM instruction definitions
+
+use super::Operation;
+use super::operands::{MemOrConstant, MemOrFpOrConstant};
+use crate::POSEIDON16_NAME;
+use crate::core::{F, Label};
+use crate::diagnostics::RunnerError;
+use crate::execution::memory::MemoryAccess;
+use crate::tables::TableT;
+use crate::{ExtensionOpMode, Table, TableTrace};
+use backend::*;
+use std::collections::BTreeMap;
+use std::fmt::{Display, Formatter};
+use std::ops::AddAssign;
+use utils::ToUsize;
+
+/// Complete set of VM instruction types with comprehensive operation support
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Instruction {
+    /// Basic arithmetic computation instruction (ADD, MUL)
+    Computation {
+        operation: Operation,
+        /// First operand
+        arg_a: MemOrConstant,
+        /// Second operand
+        arg_c: MemOrFpOrConstant,
+        /// Result
+        res: MemOrConstant,
+    },
+
+    /// Memory dereference instruction: res = m[m[fp + shift_0] + shift_1]
+    Deref {
+        /// First offset from frame pointer for base address
+        shift_0: usize,
+        /// Second offset added to dereferenced base address
+        shift_1: usize,
+        /// Result destination (can be memory, frame pointer, or constant)
+        res: MemOrFpOrConstant,
+    },
+
+    /// Conditional jump instruction for control flow
+    Jump {
+        /// Jump condition (jump if non-zero)
+        condition: MemOrConstant,
+        /// Jump destination label (for debugging purposes)
+        label: Label,
+        /// Jump destination address
+        dest: MemOrConstant,
+        /// New frame pointer value after jump
+        updated_fp: MemOrFpOrConstant,
+    },
+
+    Precompile(PrecompileInstruction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PrecompileArgs<V, S> {
+    pub arg_0: V,
+    pub arg_1: V,
+    pub res: V,
+    pub data: PrecompileCompTimeArgs<S>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PrecompileCompTimeArgs<S> {
+    Poseidon16 {
+        half_output: bool,
+        //   hardcoded_offset_left = None:              left_input = m[arg_a..arg_a+8]
+        //   hardcoded_offset_left = Some(offset_left): left_input = m[offset_left..offset_left+4] | m[arg_a..arg_a+4] (arg_a is the first runtime parameter)
+        hardcoded_offset_left: Option<S>,
+    },
+    ExtensionOp {
+        size: S,
+        mode: ExtensionOpMode,
+    },
+}
+
+impl<S> PrecompileCompTimeArgs<S> {
+    pub fn table(&self) -> Table {
+        match self {
+            Self::Poseidon16 { .. } => Table::poseidon16(),
+            Self::ExtensionOp { .. } => Table::extension_op(),
+        }
+    }
+
+    pub fn map_size<T>(self, mut f: impl FnMut(S) -> T) -> PrecompileCompTimeArgs<T> {
+        match self {
+            Self::Poseidon16 {
+                half_output,
+                hardcoded_offset_left: hardcoded_left_4,
+            } => PrecompileCompTimeArgs::Poseidon16 {
+                half_output,
+                hardcoded_offset_left: hardcoded_left_4.map(&mut f),
+            },
+            Self::ExtensionOp { size, mode } => PrecompileCompTimeArgs::ExtensionOp { size: f(size), mode },
+        }
+    }
+}
+
+impl<V, S> PrecompileArgs<V, S> {
+    pub fn operand_exprs(&self) -> [&V; 3] {
+        [&self.arg_0, &self.arg_1, &self.res]
+    }
+    pub fn operand_exprs_mut(&mut self) -> [&mut V; 3] {
+        [&mut self.arg_0, &mut self.arg_1, &mut self.res]
+    }
+}
+
+pub type PrecompileInstruction = PrecompileArgs<MemOrFpOrConstant, usize>;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct InstructionCounts {
+    pub add: usize,
+    pub mul: usize,
+    pub deref: usize,
+    pub jump: usize,
+}
+
+impl AddAssign for InstructionCounts {
+    fn add_assign(&mut self, rhs: Self) {
+        self.add += rhs.add;
+        self.mul += rhs.mul;
+        self.deref += rhs.deref;
+        self.jump += rhs.jump;
+    }
+}
+
+/// Execution context for instruction processing
+#[derive(Debug)]
+pub struct InstructionContext<'a, M: MemoryAccess> {
+    pub memory: &'a mut M,
+    pub fp: &'a mut usize,
+    pub pc: &'a mut usize,
+    pub pcs: &'a Vec<usize>,
+    pub traces: &'a mut BTreeMap<Table, TableTrace>,
+    pub counts: &'a mut InstructionCounts,
+}
+
+impl Instruction {
+    /// Execute this instruction within the given execution context
+    #[inline(always)]
+    pub fn execute_instruction<M: MemoryAccess>(&self, ctx: &mut InstructionContext<'_, M>) -> Result<(), RunnerError> {
+        match self {
+            Self::Computation {
+                operation,
+                arg_a,
+                arg_c,
+                res,
+            } => {
+                if res.is_value_unknown(ctx.memory, *ctx.fp) {
+                    let memory_address_res = res.memory_address(*ctx.fp)?;
+                    let a_value = arg_a.read_value(ctx.memory, *ctx.fp)?;
+                    let b_value = arg_c.read_value(ctx.memory, *ctx.fp)?;
+                    let res_value = operation.compute(a_value, b_value);
+                    ctx.memory.set(memory_address_res, res_value)?;
+                } else if arg_a.is_value_unknown(ctx.memory, *ctx.fp) {
+                    let memory_address_a = arg_a.memory_address(*ctx.fp)?;
+                    let res_value = res.read_value(ctx.memory, *ctx.fp)?;
+                    let b_value = arg_c.read_value(ctx.memory, *ctx.fp)?;
+                    let a_value = operation
+                        .inverse_compute(res_value, b_value)
+                        .ok_or(RunnerError::DivByZero)?;
+                    ctx.memory.set(memory_address_a, a_value)?;
+                } else if arg_c.is_value_unknown(ctx.memory, *ctx.fp) {
+                    let memory_address_b = arg_c.memory_address(*ctx.fp)?;
+                    let res_value = res.read_value(ctx.memory, *ctx.fp)?;
+                    let a_value = arg_a.read_value(ctx.memory, *ctx.fp)?;
+                    let b_value = operation
+                        .inverse_compute(res_value, a_value)
+                        .ok_or(RunnerError::DivByZero)?;
+                    ctx.memory.set(memory_address_b, b_value)?;
+                } else {
+                    let a_value = arg_a.read_value(ctx.memory, *ctx.fp)?;
+                    let b_value = arg_c.read_value(ctx.memory, *ctx.fp)?;
+                    let res_value = res.read_value(ctx.memory, *ctx.fp)?;
+                    let computed_value = operation.compute(a_value, b_value);
+                    if res_value != computed_value {
+                        return Err(RunnerError::NotEqual(computed_value, res_value));
+                    }
+                }
+
+                match operation {
+                    Operation::Add => ctx.counts.add += 1,
+                    Operation::Mul => ctx.counts.mul += 1,
+                }
+
+                *ctx.pc += 1;
+                Ok(())
+            }
+            Self::Deref { shift_0, shift_1, res } => {
+                if res.is_value_unknown(ctx.memory, *ctx.fp) {
+                    let memory_address_res = res.memory_address(*ctx.fp)?;
+                    let ptr = ctx.memory.get(*ctx.fp + shift_0)?;
+                    if let Ok(value) = ctx.memory.get(ptr.to_usize() + shift_1) {
+                        ctx.memory.set(memory_address_res, value)?;
+                    } else {
+                        // Do nothing, we are probably in a range check, will be resolved later
+                    }
+                } else {
+                    let value = res.read_value(ctx.memory, *ctx.fp).unwrap();
+                    let ptr = ctx.memory.get(*ctx.fp + shift_0)?;
+                    ctx.memory.set(ptr.to_usize() + shift_1, value)?;
+                }
+
+                ctx.counts.deref += 1;
+                *ctx.pc += 1;
+                Ok(())
+            }
+            Self::Jump {
+                condition,
+                label: _,
+                dest,
+                updated_fp,
+            } => {
+                let condition_value = condition.read_value(ctx.memory, *ctx.fp)?;
+                assert!([F::ZERO, F::ONE].contains(&condition_value),);
+                if condition_value == F::ZERO {
+                    *ctx.pc += 1;
+                } else {
+                    *ctx.pc = dest.read_value(ctx.memory, *ctx.fp)?.to_usize();
+                    *ctx.fp = updated_fp.read_value(ctx.memory, *ctx.fp)?.to_usize();
+                }
+
+                ctx.counts.jump += 1;
+                Ok(())
+            }
+
+            Self::Precompile(precompile) => {
+                precompile.data.table().execute(
+                    precompile.arg_0.read_value(ctx.memory, *ctx.fp)?,
+                    precompile.arg_1.read_value(ctx.memory, *ctx.fp)?,
+                    precompile.res.read_value(ctx.memory, *ctx.fp)?,
+                    precompile.data,
+                    ctx,
+                )?;
+
+                *ctx.pc += 1;
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<V: Display, S: Display> Display for PrecompileArgs<V, S> {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let Self {
+            arg_0,
+            arg_1,
+            res,
+            data,
+        } = self;
+        match data {
+            PrecompileCompTimeArgs::Poseidon16 {
+                half_output,
+                hardcoded_offset_left: hardcoded_left_4,
+            } => match (*half_output, hardcoded_left_4) {
+                (false, None) => write!(f, "{POSEIDON16_NAME}({arg_0}, {arg_1}, {res})"),
+                (true, None) => write!(f, "{POSEIDON16_NAME}({arg_0}, {arg_1}, {res}, half)"),
+                (false, Some(off)) => write!(f, "{POSEIDON16_NAME}({arg_0}, {arg_1}, {res}, hardcoded_left_4={off})"),
+                (true, Some(off)) => write!(
+                    f,
+                    "{POSEIDON16_NAME}({arg_0}, {arg_1}, {res}, half, hardcoded_left_4={off})"
+                ),
+            },
+            PrecompileCompTimeArgs::ExtensionOp { size, mode } => {
+                write!(f, "{}({arg_0}, {arg_1}, {res}, {size})", mode.name())
+            }
+        }
+    }
+}
+
+impl Display for Instruction {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Computation {
+                operation,
+                arg_a,
+                arg_c,
+                res,
+            } => {
+                write!(f, "{res} = {arg_a} {operation} {arg_c}")
+            }
+            Self::Deref { shift_0, shift_1, res } => {
+                write!(f, "{res} = m[m[fp + {shift_0}] + {shift_1}]")
+            }
+            Self::Jump {
+                condition,
+                label,
+                dest,
+                updated_fp,
+            } => {
+                write!(
+                    f,
+                    "if {condition} != 0 jump to {label} = {dest} with next(fp) = {updated_fp}"
+                )
+            }
+            Self::Precompile(precompile) => write!(f, "{precompile}"),
+        }
+    }
+}

@@ -1,0 +1,21 @@
+[package]
+name = "lean_compiler"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+pest.workspace = true
+pest_derive.workspace = true
+utils.workspace = true
+xmss.workspace = true
+rand.workspace = true
+
+tracing.workspace = true
+sub_protocols.workspace = true
+lean_vm.workspace = true
+backend.workspace = true
+
+[dev-dependencies]

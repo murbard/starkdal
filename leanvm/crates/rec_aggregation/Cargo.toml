@@ -1,0 +1,31 @@
+[package]
+name = "rec_aggregation"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+prox-gaps-conjecture = ["lean_prover/prox-gaps-conjecture"]
+standard-alloc = []
+
+[dependencies]
+utils.workspace = true
+xmss.workspace = true
+rand.workspace = true
+
+tracing.workspace = true
+sub_protocols.workspace = true
+lean_vm.workspace = true
+lean_compiler.workspace = true
+lean_prover.workspace = true
+backend.workspace = true
+postcard.workspace = true
+lz4_flex.workspace = true
+serde.workspace = true
+zk-alloc.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSProcessInfo", "NSString"] }

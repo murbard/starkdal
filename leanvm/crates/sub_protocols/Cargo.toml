@@ -1,0 +1,19 @@
+[package]
+name = "sub_protocols"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tracing.workspace = true
+utils.workspace = true
+
+lean_vm.workspace = true
+backend.workspace = true
+
+[dev-dependencies]
+
+rand.workspace = true
+
