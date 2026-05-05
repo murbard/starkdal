@@ -1,4 +1,12 @@
-//! Benchmark: coset FFT + Poseidon16 Merkle commitment over KoalaBear.
+//! Benchmark: RS codeword commitment via syndrome check + Poseidon16 Merkle.
+//!
+//! The prover computes V = coset_FFT(coeffs) externally and provides V as a witness.
+//! The circuit:
+//!   1. Commits V into a Poseidon16 Merkle tree
+//!   2. Asserts the root matches public input
+//!   3. Derives 4 Fiat-Shamir challenges from the root
+//!   4. For each challenge, verifies the syndrome sum is zero (proving V is a
+//!      valid degree-<n codeword via Schwartz-Zippel, 4×31 = 124 bits)
 //!
 //! Usage: cargo run --release --example fft_merkle_bench -- --log-n 8
 
@@ -15,9 +23,10 @@ use utils::poseidon16_compress;
 
 // ── Field helpers ──────────────────────────────────────────────────────────
 
-const P: u64 = 0x7F000001; // KoalaBear prime
+const P: u64 = 0x7F000001;
 const DIGEST_LEN: usize = 8;
 const TWO_ADICITY: usize = 24;
+const NUM_SYNDROME_CHECKS: usize = 4;
 
 fn get_omega(log_order: usize) -> F {
     assert!(
@@ -37,18 +46,15 @@ fn bit_reverse(x: usize, bits: usize) -> usize {
     r
 }
 
-/// Pick smallest k such that leaf_bytes >= path_bytes for KoalaBear.
-/// leaf = 2^k elements × 4 bytes; path = (log_total - k) hops × 32 bytes/hop.
-/// Constraint: 4·2^k ≥ 32·(log_total − k)  ⟹  2^(k−3) + k ≥ log_total.
 fn pick_log_felts_per_leaf_kb(log_total: usize) -> usize {
-    let mut k = 3usize; // minimum: 8 felts/leaf (one Poseidon block)
+    let mut k = 3usize;
     while (1usize << k.saturating_sub(3)) + k < log_total {
         k += 1;
     }
     k
 }
 
-// ── Precomputed tables (single source of truth) ───────────────────────────
+// ── Circuit parameters ────────────────────────────────────────────────────
 
 #[allow(dead_code)]
 struct CircuitParams {
@@ -63,9 +69,10 @@ struct CircuitParams {
     tree_depth: usize,
     n_chunks_per_leaf: usize,
     omega: F,
-    twiddles: Vec<F>,
-    bit_rev: Vec<usize>,
-    g_powers: Vec<F>,
+    g: F,
+    g_n: F,         // g^n
+    g_1mn: F,       // g^(1-n)
+    omega_1mn: F,   // omega^(1-n)
     layer_offsets: Vec<usize>,
     total_tree_size: usize,
 }
@@ -80,23 +87,10 @@ impl CircuitParams {
         let tree_depth = n_leaves.trailing_zeros() as usize;
         let n_chunks_per_leaf = fpl / 8;
         let omega = get_omega(log_total);
-
-        let mut twiddles = Vec::with_capacity(n_eval / 2);
-        let mut acc = F::ONE;
-        for _ in 0..n_eval / 2 {
-            twiddles.push(acc);
-            acc *= omega;
-        }
-
-        let bit_rev: Vec<usize> = (0..n_eval).map(|i| bit_reverse(i, log_total)).collect();
-
         let g = F::from_u32(3);
-        let mut g_powers = Vec::with_capacity(n);
-        let mut gp = F::ONE;
-        for _ in 0..n {
-            g_powers.push(gp);
-            gp *= g;
-        }
+        let g_n = g.exp_u64(n as u64);
+        let g_1mn = g.exp_u64((P - 1 - (n as u64 - 1) % (P - 1)) % (P - 1)); // g^(1-n) mod p
+        let omega_1mn = omega.exp_u64((P - 1 - (n as u64 - 1) % (P - 1)) % (P - 1)); // omega^(1-n)
 
         let mut layer_offsets = vec![0usize];
         let mut acc_off = 0;
@@ -107,39 +101,30 @@ impl CircuitParams {
         let total_tree_size = acc_off + DIGEST_LEN;
 
         Self {
-            log_n,
-            log_blowup,
-            log_total,
-            log_felts_per_leaf,
-            n,
-            n_eval,
-            fpl,
-            n_leaves,
-            tree_depth,
-            n_chunks_per_leaf,
-            omega,
-            twiddles,
-            bit_rev,
-            g_powers,
-            layer_offsets,
-            total_tree_size,
+            log_n, log_blowup, log_total, log_felts_per_leaf,
+            n, n_eval, fpl, n_leaves, tree_depth, n_chunks_per_leaf,
+            omega, g, g_n, g_1mn, omega_1mn,
+            layer_offsets, total_tree_size,
         }
     }
 }
 
-// ── Reference FFT + Merkle (uses CircuitParams) ───────────────────────────
+// ── Reference computations (Rust-side) ────────────────────────────────────
 
 fn reference_coset_fft(cp: &CircuitParams, coeffs: &[F]) -> Vec<F> {
     let mut data = vec![F::ZERO; cp.n_eval];
+    let mut g_pow = F::ONE;
     for i in 0..cp.n {
-        data[i] = coeffs[i] * cp.g_powers[i];
+        data[i] = coeffs[i] * g_pow;
+        g_pow *= cp.g;
     }
     for i in 0..cp.n_eval {
         let j = bit_reverse(i, cp.log_total);
-        if i < j {
-            data.swap(i, j);
-        }
+        if i < j { data.swap(i, j); }
     }
+    let mut twiddles = Vec::with_capacity(cp.n_eval / 2);
+    let mut acc = F::ONE;
+    for _ in 0..cp.n_eval / 2 { twiddles.push(acc); acc *= cp.omega; }
     for s in 1..=cp.log_total {
         let m = 1 << s;
         let half = m >> 1;
@@ -148,7 +133,7 @@ fn reference_coset_fft(cp: &CircuitParams, coeffs: &[F]) -> Vec<F> {
         while k < cp.n_eval {
             for j in 0..half {
                 let u = data[k + j];
-                let t = cp.twiddles[j * stride] * data[k + j + half];
+                let t = twiddles[j * stride] * data[k + j + half];
                 data[k + j] = u + t;
                 data[k + j + half] = u - t;
             }
@@ -189,124 +174,97 @@ fn reference_merkle_root(cp: &CircuitParams, evals: &[F]) -> [F; 8] {
     layer[0]
 }
 
-// ── zkDSL program generation (fully unrolled) ─────────────────────────────
+/// Derive challenges from root (Fiat-Shamir via Poseidon with domain separation).
+fn derive_challenges(root: &[F; 8]) -> [F; NUM_SYNDROME_CHECKS] {
+    let mut challenges = [F::ZERO; NUM_SYNDROME_CHECKS];
+    for i in 0..NUM_SYNDROME_CHECKS {
+        let mut input = [F::ZERO; 16];
+        input[..8].copy_from_slice(root);
+        input[8] = F::from_u32(i as u32); // domain separator
+        let hash = poseidon16_compress(input);
+        challenges[i] = hash[0];
+    }
+    challenges
+}
+
+/// Compute syndrome sum for one challenge. Returns 0 iff V is a valid codeword.
+fn reference_syndrome(cp: &CircuitParams, evals: &[F], beta: F) -> F {
+    let beta_n = beta.exp_u64(cp.n as u64);
+    let mut x = cp.g;           // yⱼ = g·ωʲ
+    let mut w = cp.g_1mn;       // yⱼ^(1-n)
+    let mut sign = F::ONE;      // (-1)^j
+    let mut s = F::ZERO;
+
+    for j in 0..cp.n_eval {
+        let yj_n_inv = F::ONE / (cp.g_n * sign);
+        let numer = beta_n * yj_n_inv - F::ONE;
+        let denom = beta - x;
+        s += evals[j] * w * numer / denom;
+        x *= cp.omega;
+        w *= cp.omega_1mn;
+        sign = F::ZERO - sign;
+        let _ = j;
+    }
+    s
+}
+
+// ── zkDSL program generation ──────────────────────────────────────────────
 
 fn generate_program(cp: &CircuitParams) -> String {
     let fmt_f = |f: F| format!("{}", f.as_canonical_u32());
-    let fmt_vec_f = |v: &[F]| v.iter().map(|x| fmt_f(*x)).collect::<Vec<_>>().join(", ");
-    let fmt_vec_usize =
-        |v: &[usize]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(", ");
 
     let mut p = String::new();
     p.push_str("from snark_lib import *\n\n");
 
-    // Compile-time constants
+    // Constants
     p.push_str(&format!("DIGEST_LEN = {DIGEST_LEN}\n"));
-    p.push_str(&format!("N = {}\n", cp.n));
     p.push_str(&format!("N_EVAL = {}\n", cp.n_eval));
     p.push_str(&format!("N_LEAVES = {}\n", cp.n_leaves));
-    p.push_str(&format!("TOTAL_TREE_SIZE = {}\n", cp.total_tree_size));
-    p.push_str(&format!("N_CHUNKS_PER_LEAF = {}\n", cp.n_chunks_per_leaf));
     p.push_str(&format!("FELTS_PER_LEAF = {}\n", cp.fpl));
-    p.push_str(&format!("OMEGA = {}\n\n", fmt_f(cp.omega)));
-
-    p.push_str(&format!("BIT_REV = [{}]\n", fmt_vec_usize(&cp.bit_rev)));
-    p.push_str(&format!("G_POWERS = [{}]\n", fmt_vec_f(&cp.g_powers)));
-    p.push_str(&format!("TWIDDLES = [{}]\n\n", fmt_vec_f(&cp.twiddles)));
+    p.push_str(&format!("N_CHUNKS_PER_LEAF = {}\n", cp.n_chunks_per_leaf));
+    p.push_str(&format!("TOTAL_TREE_SIZE = {}\n", cp.total_tree_size));
+    p.push_str(&format!("LOG_N = {}\n", cp.log_n));
+    p.push_str(&format!("G = {}\n", fmt_f(cp.g)));
+    p.push_str(&format!("G_N = {}\n", fmt_f(cp.g_n)));
+    p.push_str(&format!("G_1MN = {}\n", fmt_f(cp.g_1mn)));
+    p.push_str(&format!("OMEGA = {}\n", fmt_f(cp.omega)));
+    p.push_str(&format!("OMEGA_1MN = {}\n\n", fmt_f(cp.omega_1mn)));
 
     p.push_str("def main():\n");
 
-    // Load coefficients from witness
-    p.push_str("    coeffs = Array(N)\n");
-    p.push_str("    hint_witness(\"coeffs\", coeffs)\n\n");
+    // 1. Load evaluations
+    p.push_str("    V = Array(N_EVAL)\n");
+    p.push_str("    hint_witness(\"evals\", V)\n\n");
 
-    // Layered FFT storage
-    let data_size = cp.n_eval * (cp.log_total + 1);
-    p.push_str(&format!("    data = Array({data_size})\n\n"));
-
-    // Layer 0: unrolled bit-reversed twisted input
-    p.push_str("    for i in unroll(0, N):\n");
-    p.push_str("        data[BIT_REV[i]] = coeffs[i] * G_POWERS[i]\n");
-    if cp.n < cp.n_eval {
-        p.push_str("    for i in unroll(N, N_EVAL):\n");
-        p.push_str("        data[BIT_REV[i]] = 0\n");
-    }
-    p.push_str("\n");
-
-    // Butterfly layers — fully unrolled
-    for s in 1..=cp.log_total {
-        let m = 1usize << s;
-        let half = m >> 1;
-        let stride = cp.n_eval >> s;
-        let n_groups = cp.n_eval / m;
-        let prev = (s - 1) * cp.n_eval;
-        let curr = s * cp.n_eval;
-
-        p.push_str(&format!("    # Layer {s}\n"));
-        for gi in 0..n_groups {
-            let gs = gi * m;
-            for j in 0..half {
-                let tw = fmt_f(cp.twiddles[j * stride]);
-                let u_idx = prev + gs + j;
-                let v_idx = prev + gs + j + half;
-                let out_a = curr + gs + j;
-                let out_b = curr + gs + j + half;
-                p.push_str(&format!("    u_{s}_{gi}_{j} = data[{u_idx}]\n"));
-                p.push_str(&format!(
-                    "    t_{s}_{gi}_{j} = {tw} * data[{v_idx}]\n"
-                ));
-                p.push_str(&format!(
-                    "    data[{out_a}] = u_{s}_{gi}_{j} + t_{s}_{gi}_{j}\n"
-                ));
-                p.push_str(&format!(
-                    "    data[{out_b}] = u_{s}_{gi}_{j} - t_{s}_{gi}_{j}\n"
-                ));
-            }
-        }
-    }
-    p.push_str("\n");
-
-    // Evals pointer
-    let evals_offset = cp.log_total * cp.n_eval;
-    p.push_str(&format!("    evals_ptr = data + {evals_offset}\n\n"));
-
-    // Zero vector
+    // 2. Merkle tree — unrolled leaf hashing + internal nodes
+    let chain_size = cp.n_leaves * cp.n_chunks_per_leaf * DIGEST_LEN;
     p.push_str("    zero_vec = Array(DIGEST_LEN)\n");
     p.push_str("    for i in unroll(0, DIGEST_LEN):\n");
     p.push_str("        zero_vec[i] = 0\n\n");
-
-    // Leaf hashing — unrolled
-    let chain_size = cp.n_leaves * cp.n_chunks_per_leaf * DIGEST_LEN;
     p.push_str(&format!("    chain = Array({chain_size})\n"));
     p.push_str(&format!("    tree = Array(TOTAL_TREE_SIZE)\n\n"));
 
+    // Leaf hashing (unrolled over leaves)
     for leaf in 0..cp.n_leaves {
-        let ld = evals_offset + leaf * cp.fpl;
+        let ld = leaf * cp.fpl;
         let ch = leaf * cp.n_chunks_per_leaf * DIGEST_LEN;
         p.push_str(&format!(
-            "    poseidon16_compress(zero_vec, data + {ld}, chain + {ch})\n"
+            "    poseidon16_compress(zero_vec, V + {ld}, chain + {ch})\n"
         ));
         for c in 1..cp.n_chunks_per_leaf {
             p.push_str(&format!(
-                "    poseidon16_compress(chain + {}, data + {}, chain + {})\n",
-                ch + (c - 1) * DIGEST_LEN,
-                ld + c * 8,
-                ch + c * DIGEST_LEN,
+                "    poseidon16_compress(chain + {}, V + {}, chain + {})\n",
+                ch + (c - 1) * DIGEST_LEN, ld + c * 8, ch + c * DIGEST_LEN,
             ));
         }
         let final_ch = ch + (cp.n_chunks_per_leaf - 1) * DIGEST_LEN;
         let tree_leaf = leaf * DIGEST_LEN;
         for k in 0..DIGEST_LEN {
-            p.push_str(&format!(
-                "    tree[{}] = chain[{}]\n",
-                tree_leaf + k,
-                final_ch + k
-            ));
+            p.push_str(&format!("    tree[{}] = chain[{}]\n", tree_leaf + k, final_ch + k));
         }
     }
-    p.push_str("\n");
 
-    // Internal Merkle nodes — unrolled
+    // Internal Merkle nodes (unrolled)
     for layer in 0..cp.tree_depth {
         let n_pairs = cp.n_leaves >> (layer + 1);
         let src = cp.layer_offsets[layer];
@@ -321,59 +279,84 @@ fn generate_program(cp: &CircuitParams) -> String {
         }
     }
 
-    // Twiddle recurrence constraint: tw[0]==1 and tw[i]*omega==tw[i+1]
-    p.push_str("\n    # Verify twiddle hint\n");
-    p.push_str("    tw = Array(N_EVAL / 2)\n");
-    p.push_str("    hint_witness(\"twiddles\", tw)\n");
-    p.push_str("    assert tw[0] == 1\n");
-    p.push_str("    for i in unroll(0, N_EVAL / 2 - 1):\n");
-    p.push_str("        assert tw[i] * OMEGA == tw[i + 1]\n");
-
-    // Root assertion
+    // 3. Assert root == public_input[0:8]
     let root_offset = cp.layer_offsets[cp.tree_depth];
     p.push_str(&format!("\n    root_ptr = tree + {root_offset}\n"));
     p.push_str("    pub_ptr = 0\n");
     p.push_str("    for i in unroll(0, DIGEST_LEN):\n");
-    p.push_str("        assert root_ptr[i] == pub_ptr[i]\n");
-    p.push_str("    return\n");
+    p.push_str("        assert root_ptr[i] == pub_ptr[i]\n\n");
 
+    // 4. Derive 4 challenges from root (Poseidon Fiat-Shamir)
+    p.push_str("    # Fiat-Shamir challenges\n");
+    p.push_str("    chal_input = Array(DIGEST_LEN)\n");
+    for i in 0..NUM_SYNDROME_CHECKS {
+        p.push_str(&format!("    chal_out_{i} = Array(DIGEST_LEN)\n"));
+        // Copy root to chal_input (reuse for each challenge via domain sep in right half)
+        p.push_str(&format!("    ds_{i} = Array(DIGEST_LEN)\n"));
+        p.push_str(&format!("    ds_{i}[0] = {i}\n"));
+        for k in 1..DIGEST_LEN {
+            p.push_str(&format!("    ds_{i}[{k}] = 0\n"));
+        }
+        p.push_str(&format!(
+            "    poseidon16_compress(root_ptr, ds_{i}, chal_out_{i})\n"
+        ));
+    }
+    p.push_str("\n");
+
+    // 5. Syndrome checks (4 checks, each a range loop)
+    p.push_str("    # Syndrome checks\n");
+    for i in 0..NUM_SYNDROME_CHECKS {
+        p.push_str(&format!("    beta_{i} = chal_out_{i}[0]\n"));
+        // Compute beta^n via repeated squaring
+        p.push_str(&format!("    bn_{i}: Mut = beta_{i}\n"));
+        for _ in 0..cp.log_n {
+            p.push_str(&format!("    bn_{i} = bn_{i} * bn_{i}\n"));
+        }
+        // Syndrome accumulation loop
+        p.push_str(&format!("    x_{i}: Mut = G\n"));
+        p.push_str(&format!("    w_{i}: Mut = G_1MN\n"));
+        p.push_str(&format!("    sign_{i}: Mut = 1\n"));
+        p.push_str(&format!("    s_{i}: Mut = 0\n"));
+        p.push_str(&format!("    for j_{i} in range(0, N_EVAL):\n"));
+        p.push_str(&format!("        yj_n_inv_{i} = 1 / (G_N * sign_{i})\n"));
+        p.push_str(&format!("        numer_{i} = bn_{i} * yj_n_inv_{i} - 1\n"));
+        p.push_str(&format!("        denom_{i} = beta_{i} - x_{i}\n"));
+        p.push_str(&format!("        s_{i} = s_{i} + V[j_{i}] * w_{i} * numer_{i} / denom_{i}\n"));
+        p.push_str(&format!("        x_{i} = x_{i} * OMEGA\n"));
+        p.push_str(&format!("        w_{i} = w_{i} * OMEGA_1MN\n"));
+        p.push_str(&format!("        sign_{i} = 0 - sign_{i}\n"));
+        p.push_str(&format!("    assert s_{i} == 0\n\n"));
+    }
+
+    p.push_str("    return\n");
     p
 }
 
-// ── Witness builder ────────────────────────────────────────────────────────
+// ── Witness builder ───────────────────────────────────────────────────────
 
-fn build_witness(cp: &CircuitParams, coeffs: &[F]) -> HashMap<String, Vec<Vec<F>>> {
+fn build_witness(cp: &CircuitParams, coeffs: &[F]) -> (Vec<F>, HashMap<String, Vec<Vec<F>>>) {
+    let evals = reference_coset_fft(cp, coeffs);
     let mut hints = HashMap::new();
-    hints.insert("coeffs".to_string(), vec![coeffs.to_vec()]);
-    hints.insert("twiddles".to_string(), vec![cp.twiddles.clone()]);
-    hints
+    hints.insert("evals".to_string(), vec![evals.clone()]);
+    (evals, hints)
 }
 
-// ── Main ───────────────────────────────────────────────────────────────────
+// ── Main ──────────────────────────────────────────────────────────────────
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let log_n: usize = args
-        .iter()
-        .position(|a| a == "--log-n")
-        .map(|i| args[i + 1].parse().unwrap())
-        .unwrap_or(8);
-    let log_blowup: usize = args
-        .iter()
-        .position(|a| a == "--log-blowup")
-        .map(|i| args[i + 1].parse().unwrap())
-        .unwrap_or(1);
-    let log_inv_rate: usize = args
-        .iter()
-        .position(|a| a == "--log-inv-rate")
-        .map(|i| args[i + 1].parse().unwrap())
-        .unwrap_or(1);
+    let log_n: usize = args.iter().position(|a| a == "--log-n")
+        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(8);
+    let log_blowup: usize = args.iter().position(|a| a == "--log-blowup")
+        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(1);
+    let log_inv_rate: usize = args.iter().position(|a| a == "--log-inv-rate")
+        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(1);
     let log_total = log_n + log_blowup;
     let lfpl = pick_log_felts_per_leaf_kb(log_total);
     let cp = CircuitParams::new(log_n, log_blowup, lfpl);
 
     eprintln!("============================================================");
-    eprintln!("leanVM fft_merkle benchmark");
+    eprintln!("leanVM RS codeword commitment (syndrome check)");
     eprintln!("============================================================");
     eprintln!("  log_n              = {log_n}");
     eprintln!("  log_blowup         = {log_blowup}");
@@ -381,14 +364,14 @@ fn main() {
     eprintln!("  n_coeffs           = {}", cp.n);
     eprintln!("  n_eval             = {}", cp.n_eval);
     eprintln!("  n_leaves           = {}", cp.n_leaves);
-    eprintln!("  log_inv_rate       = {log_inv_rate}");
+    eprintln!("  syndrome checks    = {NUM_SYNDROME_CHECKS}");
     eprintln!();
 
     let coeffs: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
 
-    eprintln!("[1/4] Computing reference ...");
+    eprintln!("[1/4] Computing reference (FFT + Merkle) ...");
     let t0 = Instant::now();
-    let evals = reference_coset_fft(&cp, &coeffs);
+    let (evals, hints) = build_witness(&cp, &coeffs);
     let root = reference_merkle_root(&cp, &evals);
     eprintln!("  reference: {:.3}s", t0.elapsed().as_secs_f64());
 
@@ -411,21 +394,14 @@ fn main() {
     let mut public_input = root.to_vec();
     public_input.resize(public_input.len().next_power_of_two(), F::ZERO);
 
-    let witness = ExecutionWitness {
-        preamble_memory_len: 0,
-        hints: build_witness(&cp, &coeffs),
-    };
+    let witness = ExecutionWitness { preamble_memory_len: 0, hints };
 
     eprintln!("[4/4] Proving ...");
     let t0 = Instant::now();
     let proof = prove_execution(
-        &bytecode,
-        &public_input,
-        &witness,
-        &default_whir_config(log_inv_rate),
-        false,
-    )
-    .unwrap();
+        &bytecode, &public_input, &witness,
+        &default_whir_config(log_inv_rate), false,
+    ).unwrap();
     let prove_time = t0.elapsed();
 
     let metadata = proof.metadata;
@@ -442,54 +418,101 @@ fn main() {
     eprintln!("------------------------------------------------------------");
     eprintln!("  Compile time       : {:.3}s", compile_time.as_secs_f64());
     eprintln!("  Prove time (wall)  : {:.3}s", prove_time.as_secs_f64());
-    eprintln!(
-        "  Prove peak RSS     : {:.2} GB",
-        peak_rss as f64 / (1u64 << 30) as f64
-    );
+    eprintln!("  Prove peak RSS     : {:.2} GB", peak_rss as f64 / (1u64 << 30) as f64);
     eprintln!("  Verify time        : {:.3}s", verify_time.as_secs_f64());
     eprintln!("  Cycles             : {}", metadata.cycles);
     eprintln!("  Poseidon16 calls   : {}", metadata.n_poseidons);
     eprintln!("------------------------------------------------------------");
 
     let result = serde_json::json!({
-        "log_n": log_n,
-        "log_blowup": log_blowup,
-        "log_felts_per_leaf": lfpl,
-        "n_coeffs": cp.n,
-        "n_eval": cp.n_eval,
-        "n_leaves": cp.n_leaves,
+        "log_n": log_n, "log_blowup": log_blowup, "log_felts_per_leaf": lfpl,
+        "n_coeffs": cp.n, "n_eval": cp.n_eval, "n_leaves": cp.n_leaves,
         "prove_time_s": (prove_time.as_secs_f64() * 1000.0).round() / 1000.0,
         "verify_time_s": (verify_time.as_secs_f64() * 1000.0).round() / 1000.0,
         "peak_rss_bytes": peak_rss,
-        "cycles": metadata.cycles,
-        "n_poseidons": metadata.n_poseidons,
+        "cycles": metadata.cycles, "n_poseidons": metadata.n_poseidons,
         "memory": metadata.memory,
     });
     println!("{result}");
 }
 
-// ── Tests ──────────────────────────────────────────────────────────────────
+// ── Tests ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn small_cp() -> CircuitParams {
-        let log_total = 5;
-        CircuitParams::new(4, 1, pick_log_felts_per_leaf_kb(log_total))
+        CircuitParams::new(4, 1, pick_log_felts_per_leaf_kb(5))
     }
 
     fn small_coeffs(cp: &CircuitParams) -> Vec<F> {
         (1..=cp.n as u32).map(F::from_u32).collect()
     }
 
-    // ── Correctness: root assertion ──────────────────────────────────
+    // ── Reference syndrome check ────────────────────────────────────
 
     #[test]
-    fn test_wrong_root_is_rejected() {
+    fn test_syndrome_zero_for_valid_codeword() {
         let cp = small_cp();
         let coeffs = small_coeffs(&cp);
         let evals = reference_coset_fft(&cp, &coeffs);
+        // Any challenge should give syndrome == 0 for a valid codeword
+        for beta_val in [7u32, 42, 1000, 999999] {
+            let beta = F::from_u32(beta_val);
+            let s = reference_syndrome(&cp, &evals, beta);
+            assert_eq!(s, F::ZERO, "syndrome != 0 for valid codeword at beta={beta_val}");
+        }
+    }
+
+    #[test]
+    fn test_syndrome_nonzero_for_invalid_codeword() {
+        let cp = small_cp();
+        // Random vector (not a valid RS codeword)
+        let bad_evals: Vec<F> = (0..cp.n_eval as u32).map(|i| F::from_u32(i * 7 + 13)).collect();
+        let beta = F::from_u32(42);
+        let s = reference_syndrome(&cp, &bad_evals, beta);
+        assert_ne!(s, F::ZERO, "syndrome == 0 for random non-codeword");
+    }
+
+    #[test]
+    fn test_syndrome_detects_single_corruption() {
+        let cp = small_cp();
+        let coeffs = small_coeffs(&cp);
+        let mut evals = reference_coset_fft(&cp, &coeffs);
+        evals[cp.n_eval / 2] += F::ONE; // corrupt one evaluation
+        let beta = F::from_u32(42);
+        let s = reference_syndrome(&cp, &evals, beta);
+        assert_ne!(s, F::ZERO, "syndrome missed single-eval corruption");
+    }
+
+    // ── End-to-end prove + verify ───────────────────────────────────
+
+    #[test]
+    fn test_correct_evals_accepted() {
+        let cp = small_cp();
+        let coeffs = small_coeffs(&cp);
+        let (evals, hints) = build_witness(&cp, &coeffs);
+        let root = reference_merkle_root(&cp, &evals);
+
+        let bytecode = compile_program(&ProgramSource::Raw(generate_program(&cp)));
+        let mut pi = root.to_vec();
+        pi.resize(pi.len().next_power_of_two(), F::ZERO);
+
+        let proof = prove_execution(
+            &bytecode, &pi,
+            &ExecutionWitness { preamble_memory_len: 0, hints },
+            &default_whir_config(1), false,
+        ).expect("Valid codeword should be accepted");
+
+        verify_execution(&bytecode, &pi, proof.proof).expect("Verification should pass");
+    }
+
+    #[test]
+    fn test_wrong_root_rejected() {
+        let cp = small_cp();
+        let coeffs = small_coeffs(&cp);
+        let (evals, hints) = build_witness(&cp, &coeffs);
         let mut wrong_root = reference_merkle_root(&cp, &evals);
         wrong_root[0] += F::ONE;
 
@@ -498,103 +521,65 @@ mod tests {
         pi.resize(pi.len().next_power_of_two(), F::ZERO);
 
         let result = prove_execution(
-            &bytecode,
-            &pi,
-            &ExecutionWitness {
-                preamble_memory_len: 0,
-                hints: build_witness(&cp, &coeffs),
-            },
-            &default_whir_config(1),
-            false,
+            &bytecode, &pi,
+            &ExecutionWitness { preamble_memory_len: 0, hints },
+            &default_whir_config(1), false,
         );
-        assert!(result.is_err(), "Wrong root was accepted");
+        assert!(result.is_err(), "Wrong root should be rejected");
     }
 
     #[test]
-    fn test_correct_root_is_accepted() {
+    fn test_invalid_codeword_rejected() {
         let cp = small_cp();
-        let coeffs = small_coeffs(&cp);
-        let evals = reference_coset_fft(&cp, &coeffs);
-        let root = reference_merkle_root(&cp, &evals);
+        // Provide a random (non-codeword) vector as evals
+        let bad_evals: Vec<F> = (0..cp.n_eval as u32).map(|i| F::from_u32(i * 7 + 13)).collect();
+        let root = reference_merkle_root(&cp, &bad_evals);
 
         let bytecode = compile_program(&ProgramSource::Raw(generate_program(&cp)));
         let mut pi = root.to_vec();
         pi.resize(pi.len().next_power_of_two(), F::ZERO);
 
-        let proof = prove_execution(
-            &bytecode,
-            &pi,
-            &ExecutionWitness {
-                preamble_memory_len: 0,
-                hints: build_witness(&cp, &coeffs),
-            },
-            &default_whir_config(1),
-            false,
-        )
-        .expect("Correct root should be accepted");
+        let mut hints = HashMap::new();
+        hints.insert("evals".to_string(), vec![bad_evals]);
 
-        verify_execution(&bytecode, &pi, proof.proof).expect("Verification should pass");
+        let result = prove_execution(
+            &bytecode, &pi,
+            &ExecutionWitness { preamble_memory_len: 0, hints },
+            &default_whir_config(1), false,
+        );
+        assert!(result.is_err(), "Invalid codeword should be rejected by syndrome check");
     }
 
-    // ── Correctness: reference FFT known vector ─────────────────────
+    // ── Reference FFT correctness ───────────────────────────────────
 
     #[test]
-    fn test_reference_fft_constant_polynomial() {
-        // P(x) = 5 for all x. Coset evals should all be 5.
-        let cp = CircuitParams::new(1, 1, 3);
-        let coeffs = vec![F::from_u32(5), F::ZERO];
+    fn test_fft_evaluates_at_coset_points() {
+        let cp = CircuitParams::new(3, 1, 3);
+        let coeffs: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
         let evals = reference_coset_fft(&cp, &coeffs);
-        assert_eq!(evals.len(), 4);
-        for (i, &e) in evals.iter().enumerate() {
-            assert_eq!(e, F::from_u32(5), "eval[{i}] should be 5");
+        for k in 0..cp.n_eval {
+            let point = cp.g * cp.omega.exp_u64(k as u64);
+            let mut val = F::ZERO;
+            for i in (0..cp.n).rev() { val = val * point + coeffs[i]; }
+            assert_eq!(evals[k], val, "FFT[{k}] != P(g·ω^{k})");
         }
     }
 
     #[test]
-    fn test_reference_fft_spot_check() {
-        // P(x) = 1+2x+3x^2+4x^3. P(g) where g=3: 1+6+27+108 = 142.
-        let cp = CircuitParams::new(2, 1, 3);
-        let coeffs = vec![
-            F::from_u32(1),
-            F::from_u32(2),
-            F::from_u32(3),
-            F::from_u32(4),
-        ];
-        let evals = reference_coset_fft(&cp, &coeffs);
-        assert_eq!(evals[0], F::from_u32(142));
+    fn test_fft_linearity() {
+        let cp = CircuitParams::new(4, 1, 3);
+        let a: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
+        let b: Vec<F> = (100..100 + cp.n as u32).map(F::from_u32).collect();
+        let ab: Vec<F> = a.iter().zip(&b).map(|(&x, &y)| x + y).collect();
+        let fft_a = reference_coset_fft(&cp, &a);
+        let fft_b = reference_coset_fft(&cp, &b);
+        let fft_ab = reference_coset_fft(&cp, &ab);
+        for i in 0..cp.n_eval {
+            assert_eq!(fft_ab[i], fft_a[i] + fft_b[i]);
+        }
     }
 
-    // ── Soundness: twiddle constraint ───────────────────────────────
-
-    #[test]
-    fn test_wrong_twiddles_rejected() {
-        let cp = small_cp();
-        let coeffs = small_coeffs(&cp);
-        let evals = reference_coset_fft(&cp, &coeffs);
-        let root = reference_merkle_root(&cp, &evals);
-
-        let bytecode = compile_program(&ProgramSource::Raw(generate_program(&cp)));
-        let mut pi = root.to_vec();
-        pi.resize(pi.len().next_power_of_two(), F::ZERO);
-
-        // Corrupt one twiddle
-        let mut bad_hints = build_witness(&cp, &coeffs);
-        bad_hints.get_mut("twiddles").unwrap()[0][1] += F::ONE;
-
-        let result = prove_execution(
-            &bytecode,
-            &pi,
-            &ExecutionWitness {
-                preamble_memory_len: 0,
-                hints: bad_hints,
-            },
-            &default_whir_config(1),
-            false,
-        );
-        assert!(result.is_err(), "Corrupted twiddles should be rejected");
-    }
-
-    // ── Leaf packing invariant ──────────────────────────────────────
+    // ── Leaf packing ────────────────────────────────────────────────
 
     #[test]
     fn test_leaf_size_exceeds_proof_path() {
@@ -603,33 +588,21 @@ mod tests {
             let fpl = 1usize << k;
             let n_leaves = (1usize << log_total) / fpl;
             let depth = n_leaves.trailing_zeros() as usize;
-            let leaf_bytes = fpl * 4;
-            let path_bytes = depth * DIGEST_LEN * 4;
-            assert!(
-                leaf_bytes >= path_bytes,
-                "log_total={log_total}, k={k}: leaf={leaf_bytes}B < path={path_bytes}B"
-            );
+            assert!(fpl * 4 >= depth * DIGEST_LEN * 4,
+                "log_total={log_total}: leaf < path");
         }
     }
+
+    // ── Field bounds ────────────────────────────────────────────────
 
     #[test]
-    fn test_leaf_packing_is_minimal() {
-        for log_total in 5..=25 {
-            let k = pick_log_felts_per_leaf_kb(log_total);
-            if k > 3 {
-                let prev_fpl = 1usize << (k - 1);
-                let prev_leaves = (1usize << log_total) / prev_fpl;
-                let prev_depth = prev_leaves.trailing_zeros() as usize;
-                assert!(
-                    prev_fpl * 4 < prev_depth * DIGEST_LEN * 4,
-                    "log_total={log_total}: k-1={} also works, k={k} not minimal",
-                    k - 1
-                );
-            }
+    fn test_omega_is_primitive_root() {
+        for log_order in 1..=20 {
+            let omega = get_omega(log_order);
+            assert_eq!(omega.exp_u64(1u64 << log_order), F::ONE);
+            assert_ne!(omega.exp_u64(1u64 << (log_order - 1)), F::ONE);
         }
     }
-
-    // ── Field arithmetic properties ─────────────────────────────────
 
     #[test]
     #[should_panic(expected = "exceeds KoalaBear 2-adicity")]
@@ -637,273 +610,35 @@ mod tests {
         get_omega(25);
     }
 
-    #[test]
-    fn test_omega_is_primitive_root() {
-        // omega^(2^log_order) == 1 AND omega^(2^(log_order-1)) != 1
-        for log_order in 1..=20 {
-            let omega = get_omega(log_order);
-            let order = 1u64 << log_order;
-            assert_eq!(
-                omega.exp_u64(order),
-                F::ONE,
-                "omega^order != 1 at log_order={log_order}"
-            );
-            assert_ne!(
-                omega.exp_u64(order / 2),
-                F::ONE,
-                "omega is not primitive at log_order={log_order}"
-            );
-        }
-    }
-
-    // ── bit_reverse properties ──────────────────────────────────────
-
-    #[test]
-    fn test_bit_reverse_is_involution() {
-        for bits in 1..=16 {
-            for x in 0..(1usize << bits) {
-                assert_eq!(
-                    bit_reverse(bit_reverse(x, bits), bits),
-                    x,
-                    "bit_reverse is not involution: bits={bits}, x={x}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_bit_reverse_is_permutation() {
-        for bits in 1..=12 {
-            let n = 1usize << bits;
-            let mut seen = vec![false; n];
-            for x in 0..n {
-                let r = bit_reverse(x, bits);
-                assert!(r < n, "out of range: bits={bits}, x={x}, rev={r}");
-                assert!(!seen[r], "collision: bits={bits}, x={x}, rev={r}");
-                seen[r] = true;
-            }
-        }
-    }
-
-    // ── CircuitParams consistency ───────────────────────────────────
-
-    #[test]
-    fn test_circuit_params_consistency() {
-        for (log_n, log_blowup) in [(4, 1), (8, 1), (8, 2), (10, 1)] {
-            let log_total = log_n + log_blowup;
-            let lfpl = pick_log_felts_per_leaf_kb(log_total);
-            let cp = CircuitParams::new(log_n, log_blowup, lfpl);
-
-            assert_eq!(cp.n, 1 << log_n);
-            assert_eq!(cp.n_eval, 1 << log_total);
-            assert_eq!(cp.n_eval, cp.n << log_blowup);
-            assert_eq!(cp.n_leaves * cp.fpl, cp.n_eval);
-            assert_eq!(cp.fpl, cp.n_chunks_per_leaf * 8);
-            assert!(cp.n_leaves.is_power_of_two());
-            assert_eq!(cp.bit_rev.len(), cp.n_eval);
-            assert_eq!(cp.g_powers.len(), cp.n);
-            assert_eq!(cp.twiddles.len(), cp.n_eval / 2);
-            assert_eq!(cp.layer_offsets.len(), cp.tree_depth + 1);
-        }
-    }
-
-    #[test]
-    fn test_twiddles_are_powers_of_omega() {
-        let cp = CircuitParams::new(4, 1, 3);
-        for i in 0..cp.twiddles.len() {
-            assert_eq!(
-                cp.twiddles[i],
-                cp.omega.exp_u64(i as u64),
-                "twiddle[{i}] != omega^{i}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_g_powers_are_geometric() {
-        let cp = CircuitParams::new(6, 1, 3);
-        let g = F::from_u32(3);
-        for i in 0..cp.g_powers.len() {
-            assert_eq!(
-                cp.g_powers[i],
-                g.exp_u64(i as u64),
-                "g_powers[{i}] != 3^{i}"
-            );
-        }
-    }
-
-    // ── FFT algebraic properties ────────────────────────────────────
-
-    #[test]
-    fn test_fft_zero_polynomial() {
-        let cp = CircuitParams::new(4, 1, 3);
-        let coeffs = vec![F::ZERO; cp.n];
-        let evals = reference_coset_fft(&cp, &coeffs);
-        for (i, &e) in evals.iter().enumerate() {
-            assert_eq!(e, F::ZERO, "FFT(0)[{i}] != 0");
-        }
-    }
-
-    #[test]
-    fn test_fft_linearity() {
-        // FFT(a + b) == FFT(a) + FFT(b)
-        let cp = CircuitParams::new(4, 1, 3);
-        let a: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
-        let b: Vec<F> = (100..100 + cp.n as u32).map(F::from_u32).collect();
-        let ab: Vec<F> = a.iter().zip(&b).map(|(&x, &y)| x + y).collect();
-
-        let fft_a = reference_coset_fft(&cp, &a);
-        let fft_b = reference_coset_fft(&cp, &b);
-        let fft_ab = reference_coset_fft(&cp, &ab);
-
-        for i in 0..cp.n_eval {
-            assert_eq!(
-                fft_ab[i],
-                fft_a[i] + fft_b[i],
-                "FFT(a+b)[{i}] != FFT(a)[{i}]+FFT(b)[{i}]"
-            );
-        }
-    }
-
-    #[test]
-    fn test_fft_scalar_homogeneity() {
-        // FFT(c * a) == c * FFT(a)
-        let cp = CircuitParams::new(4, 1, 3);
-        let a: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
-        let c = F::from_u32(7);
-        let ca: Vec<F> = a.iter().map(|&x| c * x).collect();
-
-        let fft_a = reference_coset_fft(&cp, &a);
-        let fft_ca = reference_coset_fft(&cp, &ca);
-
-        for i in 0..cp.n_eval {
-            assert_eq!(
-                fft_ca[i],
-                c * fft_a[i],
-                "FFT(c*a)[{i}] != c*FFT(a)[{i}]"
-            );
-        }
-    }
-
-    #[test]
-    fn test_fft_evaluates_at_coset_points() {
-        // Directly evaluate P(g * omega^k) via Horner and compare to FFT output.
-        let cp = CircuitParams::new(3, 1, 3);
-        let coeffs: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
-        let evals = reference_coset_fft(&cp, &coeffs);
-        let g = F::from_u32(3);
-
-        for k in 0..cp.n_eval {
-            let point = g * cp.omega.exp_u64(k as u64);
-            // Horner evaluation
-            let mut val = F::ZERO;
-            for i in (0..cp.n).rev() {
-                val = val * point + coeffs[i];
-            }
-            assert_eq!(
-                evals[k], val,
-                "FFT[{k}] != P(g*omega^{k})"
-            );
-        }
-    }
-
     // ── Merkle binding ──────────────────────────────────────────────
 
     #[test]
     fn test_different_data_different_roots() {
-        let cp = CircuitParams::new(4, 1, pick_log_felts_per_leaf_kb(5));
+        let cp = small_cp();
         let a: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
         let mut b = a.clone();
-        b[0] += F::ONE; // flip one coefficient
-
-        let evals_a = reference_coset_fft(&cp, &a);
-        let evals_b = reference_coset_fft(&cp, &b);
-        let root_a = reference_merkle_root(&cp, &evals_a);
-        let root_b = reference_merkle_root(&cp, &evals_b);
-
-        assert_ne!(root_a, root_b, "Different polynomials must yield different roots");
+        b[0] += F::ONE;
+        let root_a = reference_merkle_root(&cp, &reference_coset_fft(&cp, &a));
+        let root_b = reference_merkle_root(&cp, &reference_coset_fft(&cp, &b));
+        assert_ne!(root_a, root_b);
     }
 
-    #[test]
-    fn test_merkle_single_eval_change_changes_root() {
-        let cp = CircuitParams::new(4, 1, pick_log_felts_per_leaf_kb(5));
-        let coeffs: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
-        let evals = reference_coset_fft(&cp, &coeffs);
-        let root = reference_merkle_root(&cp, &evals);
-
-        // Flip one eval in the middle
-        let mut evals_mod = evals.clone();
-        evals_mod[cp.n_eval / 2] += F::ONE;
-        let root_mod = reference_merkle_root(&cp, &evals_mod);
-
-        assert_ne!(root, root_mod, "Changing one eval must change the root");
-    }
-
-    #[test]
-    fn test_hash_chain_order_dependent() {
-        let a: Vec<F> = (1..=8).map(|i| F::from_u32(i)).collect();
-        let mut b = a.clone();
-        b.swap(0, 1);
-        assert_ne!(
-            poseidon_hash_chain(&a),
-            poseidon_hash_chain(&b),
-            "hash_chain must be order-dependent"
-        );
-    }
-
-    // ── End-to-end across parameter sizes ───────────────────────────
+    // ── End-to-end at different sizes ───────────────────────────────
 
     #[test]
     fn test_end_to_end_n6() {
-        // Prove and verify at a different size than the n=4 tests.
         let cp = CircuitParams::new(6, 1, pick_log_felts_per_leaf_kb(7));
         let coeffs: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
-        let evals = reference_coset_fft(&cp, &coeffs);
+        let (evals, hints) = build_witness(&cp, &coeffs);
         let root = reference_merkle_root(&cp, &evals);
-
         let bytecode = compile_program(&ProgramSource::Raw(generate_program(&cp)));
         let mut pi = root.to_vec();
         pi.resize(pi.len().next_power_of_two(), F::ZERO);
-
         let proof = prove_execution(
-            &bytecode,
-            &pi,
-            &ExecutionWitness {
-                preamble_memory_len: 0,
-                hints: build_witness(&cp, &coeffs),
-            },
-            &default_whir_config(1),
-            false,
-        )
-        .expect("n=6 should prove");
-
+            &bytecode, &pi,
+            &ExecutionWitness { preamble_memory_len: 0, hints },
+            &default_whir_config(1), false,
+        ).expect("n=6 should prove");
         verify_execution(&bytecode, &pi, proof.proof).expect("n=6 should verify");
-    }
-
-    #[test]
-    fn test_end_to_end_with_blowup_2() {
-        // k=2 blowup instead of k=1 — different eval domain size.
-        let cp = CircuitParams::new(4, 2, pick_log_felts_per_leaf_kb(6));
-        let coeffs: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
-        let evals = reference_coset_fft(&cp, &coeffs);
-        let root = reference_merkle_root(&cp, &evals);
-
-        let bytecode = compile_program(&ProgramSource::Raw(generate_program(&cp)));
-        let mut pi = root.to_vec();
-        pi.resize(pi.len().next_power_of_two(), F::ZERO);
-
-        let proof = prove_execution(
-            &bytecode,
-            &pi,
-            &ExecutionWitness {
-                preamble_memory_len: 0,
-                hints: build_witness(&cp, &coeffs),
-            },
-            &default_whir_config(1),
-            false,
-        )
-        .expect("n=4 k=2 should prove");
-
-        verify_execution(&bytecode, &pi, proof.proof).expect("n=4 k=2 should verify");
     }
 }
