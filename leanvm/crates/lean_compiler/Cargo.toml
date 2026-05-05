@@ -18,3 +18,4 @@ lean_vm.workspace = true
 backend.workspace = true
 
 [dev-dependencies]
+xmss.workspace = true

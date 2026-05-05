@@ -23,3 +23,5 @@ backend.workspace = true
 itertools.workspace = true
 
 [dev-dependencies]
+xmss.workspace = true
+rec_aggregation.workspace = true

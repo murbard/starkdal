@@ -14,3 +14,4 @@ rand.workspace = true
 tracing.workspace = true
 backend.workspace = true
 itertools.workspace = true
+xmss.workspace = true
