@@ -79,6 +79,7 @@ struct CircuitParams {
 
 impl CircuitParams {
     fn new(log_n: usize, log_blowup: usize, log_felts_per_leaf: usize) -> Self {
+        assert!(log_blowup == 1, "syndrome check currently requires log_blowup == 1 (N = 2n)");
         let log_total = log_n + log_blowup;
         let n = 1usize << log_n;
         let n_eval = 1usize << log_total;
@@ -89,8 +90,9 @@ impl CircuitParams {
         let omega = get_omega(log_total);
         let g = F::from_u32(3);
         let g_n = g.exp_u64(n as u64);
-        let g_1mn = g.exp_u64((P - 1 - (n as u64 - 1) % (P - 1)) % (P - 1)); // g^(1-n) mod p
-        let omega_1mn = omega.exp_u64((P - 1 - (n as u64 - 1) % (P - 1)) % (P - 1)); // omega^(1-n)
+        // g^(1-n) = g^(P-1-(n-1)) by Fermat's little theorem
+        let g_1mn = g.exp_u64(P - 1 - (n as u64 - 1));
+        let omega_1mn = omega.exp_u64(P - 1 - (n as u64 - 1));
 
         let mut layer_offsets = vec![0usize];
         let mut acc_off = 0;
@@ -174,19 +176,6 @@ fn reference_merkle_root(cp: &CircuitParams, evals: &[F]) -> [F; 8] {
     layer[0]
 }
 
-/// Derive challenges from root (Fiat-Shamir via Poseidon with domain separation).
-fn derive_challenges(root: &[F; 8]) -> [F; NUM_SYNDROME_CHECKS] {
-    let mut challenges = [F::ZERO; NUM_SYNDROME_CHECKS];
-    for i in 0..NUM_SYNDROME_CHECKS {
-        let mut input = [F::ZERO; 16];
-        input[..8].copy_from_slice(root);
-        input[8] = F::from_u32(i as u32); // domain separator
-        let hash = poseidon16_compress(input);
-        challenges[i] = hash[0];
-    }
-    challenges
-}
-
 /// Compute syndrome sum for one challenge. Returns 0 iff V is a valid codeword.
 fn reference_syndrome(cp: &CircuitParams, evals: &[F], beta: F) -> F {
     let beta_n = beta.exp_u64(cp.n as u64);
@@ -203,7 +192,6 @@ fn reference_syndrome(cp: &CircuitParams, evals: &[F], beta: F) -> F {
         x *= cp.omega;
         w *= cp.omega_1mn;
         sign = F::ZERO - sign;
-        let _ = j;
     }
     s
 }
@@ -288,7 +276,6 @@ fn generate_program(cp: &CircuitParams) -> String {
 
     // 4. Derive 4 challenges from root (Poseidon Fiat-Shamir)
     p.push_str("    # Fiat-Shamir challenges\n");
-    p.push_str("    chal_input = Array(DIGEST_LEN)\n");
     for i in 0..NUM_SYNDROME_CHECKS {
         p.push_str(&format!("    chal_out_{i} = Array(DIGEST_LEN)\n"));
         // Copy root to chal_input (reuse for each challenge via domain sep in right half)
