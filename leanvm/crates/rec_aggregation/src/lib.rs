@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::compilation::bytecode_reduction_sumcheck_proof_size;
 pub use crate::compilation::{get_aggregation_bytecode, init_aggregation_bytecode};
+pub use crate::compilation::{get_dal_aggregation_bytecode, init_dal_aggregation_bytecode};
 
 pub mod benchmark;
 mod compilation;

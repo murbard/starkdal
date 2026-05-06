@@ -345,6 +345,17 @@ fn build_replacements(
     replacements.insert("STARTING_PC_PLACEHOLDER".to_string(), STARTING_PC.to_string());
     replacements.insert("ENDING_PC_PLACEHOLDER".to_string(), ENDING_PC.to_string());
 
+    // Bytecode zero eval
+    replacements.insert(
+        "BYTECODE_ZERO_EVAL_PLACEHOLDER".to_string(),
+        bytecode_zero_eval.as_canonical_u64().to_string(),
+    );
+    replacements.insert("ZERO_VEC_LEN_PLACEHOLDER".to_string(), ZERO_VEC_LEN.to_string());
+    replacements.insert(
+        "NUM_REPEATED_ONES_PLACEHOLDER".to_string(),
+        NUM_REPEATED_ONES.to_string(),
+    );
+
     // XMSS-specific replacements
     replacements.insert("V_PLACEHOLDER".to_string(), V.to_string());
     replacements.insert("W_PLACEHOLDER".to_string(), W.to_string());
@@ -362,18 +373,66 @@ fn build_replacements(
     );
     replacements.insert("XMSS_DIGEST_LEN_PLACEHOLDER".to_string(), XMSS_DIGEST_LEN.to_string());
 
-    // Bytecode zero eval
-    replacements.insert(
-        "BYTECODE_ZERO_EVAL_PLACEHOLDER".to_string(),
-        bytecode_zero_eval.as_canonical_u64().to_string(),
-    );
-    replacements.insert("ZERO_VEC_LEN_PLACEHOLDER".to_string(), ZERO_VEC_LEN.to_string());
-    replacements.insert(
-        "NUM_REPEATED_ONES_PLACEHOLDER".to_string(),
-        NUM_REPEATED_ONES.to_string(),
-    );
-
     replacements
+}
+
+// ── DAL aggregation compilation ───────────────────────────────────────────
+
+static DAL_BYTECODE: OnceLock<Bytecode> = OnceLock::new();
+
+pub fn get_dal_aggregation_bytecode() -> &'static Bytecode {
+    DAL_BYTECODE
+        .get()
+        .unwrap_or_else(|| panic!("call init_dal_aggregation_bytecode() first"))
+}
+
+pub fn init_dal_aggregation_bytecode(max_children: usize) {
+    DAL_BYTECODE.get_or_init(|| compile_dal_program_self_referential(max_children));
+}
+
+fn compile_dal_program(program_log_size: usize, bytecode_zero_eval: F, max_children: usize) -> Bytecode {
+    let bytecode_point_n_vars = program_log_size + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
+    let claim_data_size = (bytecode_point_n_vars + 1) * DIMENSION;
+    let claim_data_size_padded = claim_data_size.next_multiple_of(DIGEST_LEN);
+    // DAL input_data layout:
+    //   full_root(8) + betas(4) + n_children(1) + bytecode_claim_padded + bytecode_hash_domsep(8)
+    let input_data_size = DIGEST_LEN + 4 + 1 + claim_data_size_padded + DIGEST_LEN;
+    let input_data_size_padded = input_data_size.next_multiple_of(DIGEST_LEN);
+
+    let mut replacements = build_replacements(program_log_size, bytecode_zero_eval, input_data_size_padded);
+
+    // DAL-specific replacements
+    replacements.insert("MAX_CHILDREN_PLACEHOLDER".to_string(), max_children.to_string());
+    let bytecode_claim_offset = DIGEST_LEN + 4 + 1;
+    replacements.insert("BYTECODE_CLAIM_OFFSET_PLACEHOLDER".to_string(), bytecode_claim_offset.to_string());
+    let bytecode_hash_domsep_offset = bytecode_claim_offset + claim_data_size_padded;
+    replacements.insert("BYTECODE_HASH_DOMSEP_OFFSET_PLACEHOLDER".to_string(), bytecode_hash_domsep_offset.to_string());
+
+    let filepath = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("dal_main.py")
+        .to_str()
+        .unwrap()
+        .to_string();
+    compile_program_with_flags(&ProgramSource::Filepath(filepath), CompilationFlags { replacements })
+}
+
+fn compile_dal_program_self_referential(max_children: usize) -> Bytecode {
+    let mut log_size_guess = 18;
+    let bytecode_zero_eval = F::ONE;
+    loop {
+        let bytecode = compile_dal_program(log_size_guess, bytecode_zero_eval, max_children);
+        assert_eq!(bytecode_zero_eval, bytecode.instructions_multilinear[0]);
+        let actual_log_size = bytecode.log_size();
+        if actual_log_size == log_size_guess {
+            return bytecode;
+        } else {
+            println!(
+                "DAL compile: wrong guess {}, actual {}, recompiling...",
+                log_size_guess, actual_log_size
+            );
+        }
+        log_size_guess = actual_log_size;
+    }
 }
 
 pub(crate) fn bytecode_reduction_sumcheck_proof_size(bytecode_point_n_vars: usize) -> usize {
