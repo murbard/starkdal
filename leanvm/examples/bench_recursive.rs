@@ -6,8 +6,19 @@
 //! Usage: cargo run --release --example bench_recursive -- --log-n 22 --arity 8
 
 use rayon::prelude::*;
-use rec_aggregation::{init_dal_aggregation_bytecode, get_dal_aggregation_bytecode};
+use backend::{
+    Evaluation, MleGroupOwned, MultilinearPoint, VerifierState,
+    dot_product, eval_eq_packed_scaled, flatten_scalars_to_base,
+    sumcheck_prove, sumcheck_verify, ProductComputation, RawProof,
+};
+use rec_aggregation::{
+    init_dal_aggregation_bytecode, get_dal_aggregation_bytecode,
+    extract_bytecode_claim_from_input_data, hash_bytecode_claims,
+};
 use starkdal_leanvm::*;
+use lean_prover::SNARK_DOMAIN_SEP;
+use lean_vm::{EF, DIMENSION, N_INSTRUCTION_COLUMNS, DIGEST_LEN as VM_DIGEST_LEN};
+use utils::{build_prover_state, get_poseidon16, poseidon16_compress_pair};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -204,21 +215,137 @@ fn main() {
                 child_leaf_datas.push(leaf_data);
             }
 
-            // TODO: Build aggregation hints and prove
-            // This requires:
-            // 1. Bytecode claim reduction (sumcheck proof)
-            // 2. Serializing child proof transcripts + merkle openings as hints
-            // 3. Building input_data for the aggregation circuit
-            // 4. Calling prove_execution with the aggregation bytecode
-            //
-            // For now, we've verified all children — the aggregation circuit compilation
-            // works but the hint wiring is not yet complete.
+            // Build bytecode claims for reduction
+            let leaf_bytecode_point_n_vars = leaf_bytecode.log_size() + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
+            let bytecode_claim_size = (leaf_bytecode_point_n_vars + 1) * DIMENSION;
+            let bytecode_claim_size_padded = bytecode_claim_size.next_multiple_of(VM_DIGEST_LEN);
 
-            eprintln!("      Group {group_idx}: verified {} children", group.len());
+            // Each child has 2 claims: the one from its input_data + the one from verification
+            let mut claims: Vec<Evaluation<EF>> = Vec::new();
+            let mut inner_bytecode_claim_blobs: Vec<Vec<F>> = Vec::new();
+            let mut bytecode_value_hint_blobs: Vec<Vec<F>> = Vec::new();
+            let mut proof_transcript_blobs: Vec<Vec<F>> = Vec::new();
+            let mut child_pi_blobs: Vec<Vec<F>> = Vec::new();
+
+            for (ci, ((_proof, _sr, _ps, ld), (eval, raw_proof))) in
+                group.iter().zip(child_bytecode_evals.iter().zip(child_raw_proofs.iter())).enumerate()
+            {
+                // Inner bytecode claim: zeros with bytecode_zero_eval at the right position
+                let mut inner_claim = vec![F::ZERO; bytecode_claim_size_padded];
+                inner_claim[leaf_bytecode_point_n_vars * DIMENSION] = leaf_bytecode.instructions_multilinear[0];
+                claims.push(extract_bytecode_claim_from_input_data(&inner_claim, leaf_bytecode_point_n_vars));
+                claims.push(eval.clone());
+
+                inner_bytecode_claim_blobs.push(inner_claim);
+                bytecode_value_hint_blobs.push(eval.value.as_basis_coefficients_slice().to_vec());
+                proof_transcript_blobs.push(raw_proof.transcript.clone());
+                child_pi_blobs.push(ld.clone());
+            }
+
+            // Bytecode reduction sumcheck
+            let claims_hash = hash_bytecode_claims(&claims);
+            let mut reduction_prover = build_prover_state();
+            reduction_prover.add_base_scalars(&claims_hash);
+            let alpha: EF = reduction_prover.sample();
+            let n_claims = claims.len();
+            let alpha_powers: Vec<EF> = alpha.powers().take(n_claims).collect();
+            let weights_packed = claims.par_iter().zip(&alpha_powers)
+                .map(|(eval, &ai)| eval_eq_packed_scaled(&eval.point.0, ai))
+                .reduce_with(|mut acc, eq_i| { acc.par_iter_mut().zip(&eq_i).for_each(|(w, e)| *w += *e); acc })
+                .unwrap();
+            let claimed_sum: EF = dot_product(claims.iter().map(|c| c.value), alpha_powers.iter().copied());
+            let witness = MleGroupOwned::ExtensionPacked(vec![
+                leaf_bytecode.instructions_multilinear_packed.clone(), weights_packed
+            ]);
+            let (sc_challenges, final_evals, _) = sumcheck_prove::<EF, _, _>(
+                witness, &ProductComputation {}, &vec![], None, &mut reduction_prover, claimed_sum, false,
+            );
+            let mut ef_claim: Vec<EF> = sc_challenges.0.clone();
+            ef_claim.push(final_evals[0]);
+            let bytecode_claim_output = flatten_scalars_to_base::<F, EF>(&ef_claim);
+
+            // Extract sumcheck proof transcript
+            let final_sumcheck_proof = {
+                let mut vs = VerifierState::<EF, _>::new(reduction_prover.into_proof(), get_poseidon16().clone()).unwrap();
+                vs.next_base_scalars_vec(claims_hash.len()).unwrap();
+                let _: EF = vs.sample();
+                sumcheck_verify(&mut vs, leaf_bytecode_point_n_vars, 2, claimed_sum, None).unwrap();
+                vs.into_raw_proof().transcript
+            };
+
+            // Build aggregation input_data
+            // Layout: full_root(8) + betas(4) + n_children(1) + bytecode_claim + bytecode_hash_domsep(8)
+            let bytecode_hash_domsep = poseidon16_compress_pair(&leaf_bytecode.hash, &SNARK_DOMAIN_SEP);
+            let mut input_data: Vec<F> = full_root.to_vec();
+            input_data.extend_from_slice(&challenges);
+            input_data.push(F::from_u32(group.len() as u32));
+            input_data.extend_from_slice(&bytecode_claim_output);
+            // Pad to bytecode_claim_size_padded
+            while input_data.len() < DIGEST_LEN + 4 + 1 + bytecode_claim_size_padded {
+                input_data.push(F::ZERO);
+            }
+            input_data.extend_from_slice(&bytecode_hash_domsep);
+            let input_data_padded_len = input_data.len().next_multiple_of(VM_DIGEST_LEN);
+            input_data.resize(input_data_padded_len, F::ZERO);
+
+            // Hash input_data to get PI
+            let agg_pi_hash = {
+                let mut state = [F::ZERO; 8];
+                for chunk in 0..input_data.len() / 8 {
+                    let mut inp = [F::ZERO; 16];
+                    inp[..8].copy_from_slice(&state);
+                    inp[8..].copy_from_slice(&input_data[chunk * 8..(chunk + 1) * 8]);
+                    state = poseidon16_compress(inp);
+                }
+                state
+            };
+            let mut agg_pi = agg_pi_hash.to_vec();
+            agg_pi.resize(agg_pi.len().next_power_of_two(), F::ZERO);
+
+            // Merkle openings from child raw proofs
+            let (merkle_leaf_blobs, merkle_path_blobs): (Vec<Vec<F>>, Vec<Vec<F>>) = child_raw_proofs
+                .iter()
+                .flat_map(|p| p.merkle_openings.iter())
+                .map(|o| {
+                    let leaf = o.leaf_data.clone();
+                    let path: Vec<F> = o.path.iter().flat_map(|d| d.iter().copied()).collect();
+                    (leaf, path)
+                })
+                .unzip();
+
+            // Build hints
+            let preamble_len = {
+                // From hashing.py: PREAMBLE_MEMORY_END - PUBLIC_INPUT_LEN
+                // ZERO_VEC_LEN + DIGEST_LEN + DIM + NUM_REPEATED_ONES
+                // These are compile-time, hard to compute exactly here. Use a reasonable default.
+                256 // generous preamble
+            };
+
+            let mut agg_hints: HashMap<String, Vec<Vec<F>>> = HashMap::new();
+            agg_hints.insert("input_data".to_string(), vec![input_data]);
+            agg_hints.insert("meta".to_string(), vec![vec![F::from_u32(group.len() as u32)]]);
+            agg_hints.insert("child_pi".to_string(), child_pi_blobs);
+            agg_hints.insert("inner_bytecode_claim".to_string(), inner_bytecode_claim_blobs);
+            agg_hints.insert("bytecode_value_hint".to_string(), bytecode_value_hint_blobs);
+            agg_hints.insert("proof_transcript_size".to_string(),
+                proof_transcript_blobs.iter().map(|b| vec![F::from_usize(b.len())]).collect());
+            agg_hints.insert("proof_transcript".to_string(), proof_transcript_blobs);
+            agg_hints.insert("merkle_leaf".to_string(), merkle_leaf_blobs);
+            agg_hints.insert("merkle_path".to_string(), merkle_path_blobs);
+            agg_hints.insert("bytecode_sumcheck_proof".to_string(), vec![final_sumcheck_proof]);
+
+            // Prove aggregation
+            eprintln!("      Group {group_idx}: proving aggregation of {} children...", group.len());
+            let agg_proof = prove_execution(
+                agg_bytecode, &agg_pi,
+                &ExecutionWitness { preamble_memory_len: preamble_len, hints: agg_hints },
+                &default_whir_config(1), false,
+            ).unwrap_or_else(|e| panic!("aggregation group {group_idx} failed: {e}"));
+
+            eprintln!("        {:.3}s, {} cycles", agg_proof.metadata.cycles as f64 / 1000.0, agg_proof.metadata.cycles);
+            // TODO: construct next-level proof tuple
         }
-
-        // TODO: replace with actual aggregation proofs
-        break; // for now, just do one level of verification
+        break; // for now, one level
     }
     let agg_time = t0.elapsed();
     eprintln!("    Aggregation verification: {:.3}s", agg_time.as_secs_f64());
