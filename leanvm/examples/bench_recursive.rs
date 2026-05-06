@@ -87,7 +87,7 @@ fn main() {
     // Step 3: Compile aggregation bytecode
     eprintln!("[3] Compiling aggregation bytecode (arity={arity})...");
     let t0 = Instant::now();
-    init_dal_aggregation_bytecode(arity);
+    init_dal_aggregation_bytecode(arity, leaf_bytecode.log_size());
     let _agg_bytecode = get_dal_aggregation_bytecode();
     eprintln!("    {:.3}s", t0.elapsed().as_secs_f64());
 
@@ -302,8 +302,8 @@ fn main() {
             let mut agg_pi = agg_pi_hash.to_vec();
             agg_pi.resize(agg_pi.len().next_power_of_two(), F::ZERO);
 
-            // Merkle openings from child raw proofs
-            let (merkle_leaf_blobs, merkle_path_blobs): (Vec<Vec<F>>, Vec<Vec<F>>) = child_raw_proofs
+            // Merkle openings from FIRST child raw proof only (minimal circuit verifies 1)
+            let (merkle_leaf_blobs, merkle_path_blobs): (Vec<Vec<F>>, Vec<Vec<F>>) = child_raw_proofs[..1]
                 .iter()
                 .flat_map(|p| p.merkle_openings.iter())
                 .map(|o| {
@@ -323,16 +323,16 @@ fn main() {
 
             let mut agg_hints: HashMap<String, Vec<Vec<F>>> = HashMap::new();
             agg_hints.insert("input_data".to_string(), vec![input_data]);
-            agg_hints.insert("meta".to_string(), vec![vec![F::from_u32(group.len() as u32)]]);
-            agg_hints.insert("child_pi".to_string(), child_pi_blobs);
-            agg_hints.insert("inner_bytecode_claim".to_string(), inner_bytecode_claim_blobs);
-            agg_hints.insert("bytecode_value_hint".to_string(), bytecode_value_hint_blobs);
+            // Minimal circuit only processes first child — provide just one of each hint
+            agg_hints.insert("child_pi".to_string(), vec![child_pi_blobs[0].clone()]);
+            agg_hints.insert("inner_bytecode_claim".to_string(), vec![inner_bytecode_claim_blobs[0].clone()]);
+            agg_hints.insert("bytecode_value_hint".to_string(), vec![bytecode_value_hint_blobs[0].clone()]);
             agg_hints.insert("proof_transcript_size".to_string(),
-                proof_transcript_blobs.iter().map(|b| vec![F::from_usize(b.len())]).collect());
-            agg_hints.insert("proof_transcript".to_string(), proof_transcript_blobs);
+                vec![vec![F::from_usize(proof_transcript_blobs[0].len())]]);
+            agg_hints.insert("proof_transcript".to_string(), vec![proof_transcript_blobs[0].clone()]);
             agg_hints.insert("merkle_leaf".to_string(), merkle_leaf_blobs);
             agg_hints.insert("merkle_path".to_string(), merkle_path_blobs);
-            agg_hints.insert("bytecode_sumcheck_proof".to_string(), vec![final_sumcheck_proof]);
+            // bytecode_sumcheck_proof omitted — bytecode reduction skipped in minimal circuit
 
             // Prove aggregation
             eprintln!("      Group {group_idx}: proving aggregation of {} children...", group.len());

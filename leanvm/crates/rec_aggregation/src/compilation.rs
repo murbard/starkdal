@@ -386,12 +386,14 @@ pub fn get_dal_aggregation_bytecode() -> &'static Bytecode {
         .unwrap_or_else(|| panic!("call init_dal_aggregation_bytecode() first"))
 }
 
-pub fn init_dal_aggregation_bytecode(max_children: usize) {
-    DAL_BYTECODE.get_or_init(|| compile_dal_program_self_referential(max_children));
+pub fn init_dal_aggregation_bytecode(max_children: usize, inner_bytecode_log_size: usize) {
+    DAL_BYTECODE.get_or_init(|| compile_dal_program_self_referential(max_children, inner_bytecode_log_size));
 }
 
-fn compile_dal_program(program_log_size: usize, bytecode_zero_eval: F, max_children: usize) -> Bytecode {
-    let bytecode_point_n_vars = program_log_size + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
+fn compile_dal_program(inner_log_size: usize, bytecode_zero_eval: F, max_children: usize) -> Bytecode {
+    // CRITICAL: inner_log_size is the LEAF bytecode's log_size, not the aggregation circuit's.
+    // The aggregation circuit verifies leaf proofs, so LOG_GUEST_BYTECODE_LEN = leaf log_size.
+    let bytecode_point_n_vars = inner_log_size + log2_ceil_usize(N_INSTRUCTION_COLUMNS);
     let claim_data_size = (bytecode_point_n_vars + 1) * DIMENSION;
     let claim_data_size_padded = claim_data_size.next_multiple_of(DIGEST_LEN);
     // DAL input_data layout:
@@ -399,7 +401,7 @@ fn compile_dal_program(program_log_size: usize, bytecode_zero_eval: F, max_child
     let input_data_size = DIGEST_LEN + 4 + 1 + claim_data_size_padded + DIGEST_LEN;
     let input_data_size_padded = input_data_size.next_multiple_of(DIGEST_LEN);
 
-    let mut replacements = build_replacements(program_log_size, bytecode_zero_eval, input_data_size_padded);
+    let mut replacements = build_replacements(inner_log_size, bytecode_zero_eval, input_data_size_padded);
 
     // DAL-specific replacements
     replacements.insert("MAX_CHILDREN_PLACEHOLDER".to_string(), max_children.to_string());
@@ -416,11 +418,16 @@ fn compile_dal_program(program_log_size: usize, bytecode_zero_eval: F, max_child
     compile_program_with_flags(&ProgramSource::Filepath(filepath), CompilationFlags { replacements })
 }
 
-fn compile_dal_program_self_referential(max_children: usize) -> Bytecode {
-    let mut log_size_guess = 18;
+fn compile_dal_program_self_referential(max_children: usize, inner_log_size: usize) -> Bytecode {
     let bytecode_zero_eval = F::ONE;
+    // Just compile once — we don't need self-referential for DAL since the aggregation
+    // circuit verifies LEAF proofs (different bytecode hash), not itself.
+    let bytecode = compile_dal_program(inner_log_size, bytecode_zero_eval, max_children);
+    return bytecode;
+    // The self-referential loop below is only needed if the circuit verifies its own bytecode.
+    let mut log_size_guess = 18;
     loop {
-        let bytecode = compile_dal_program(log_size_guess, bytecode_zero_eval, max_children);
+        let bytecode = compile_dal_program(inner_log_size, bytecode_zero_eval, max_children);
         assert_eq!(bytecode_zero_eval, bytecode.instructions_multilinear[0]);
         let actual_log_size = bytecode.log_size();
         if actual_log_size == log_size_guess {
