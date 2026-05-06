@@ -5,7 +5,7 @@ use std::time::Instant;
 
 pub use backend::*;
 pub use lean_compiler::*;
-pub use lean_prover::prove_execution::prove_execution;
+pub use lean_prover::prove_execution::{prove_execution, ExecutionProof};
 pub use lean_prover::verify_execution::verify_execution;
 pub use lean_prover::*;
 pub use lean_vm::*;
