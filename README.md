@@ -1,53 +1,123 @@
 # starkdal
 
-Experimental prototype for a "dumb" Data Availability Layer (DAL) commitment scheme. The idea: prove the full polynomial evaluation + Merkle commitment inside a STARK, so every leaf under the root is *exactly* correct — not just δ-close as with FRI/FRIDA-style approaches. This matters for DAS systems where nodes must rebroadcast leaves with valid Merkle proofs.
+Experimental prototype for a "dumb" Data Availability Layer (DAL) commitment scheme. The idea: prove the full polynomial evaluation + Merkle commitment inside a STARK, so every leaf under the root is *exactly* correct — not just delta-close as with FRI/FRIDA-style approaches. This matters for DAS systems where nodes must rebroadcast leaves with valid Merkle proofs.
 
 **This is a playground for benchmarking, not production code.**
 
 ## What it does
 
-1. Start with 2^n coefficients over a prime field (the data to commit)
-2. Coset FFT to 2^(n+k) evaluations (Reed-Solomon encoding with blowup factor 2^k)
-3. Build a Merkle tree over chunks of evaluations (leaf size chosen so leaf ≥ proof path)
-4. Prove the whole thing in a zkVM — the proof attests that the committed root is the *exact* RS encoding of the original data
+1. Start with polynomials over a prime field (the data to commit)
+2. RS-encode: coset FFT to evaluation domain (rate 1/2)
+3. Commit: Poseidon Merkle tree over the evaluations
+4. Prove inside a zkVM: the proof attests the committed root is the *exact* RS encoding
 
-## Implementations
+## Approaches
 
-### `leanvm/` — primary
+Three circuit strategies, each trading off complexity for throughput:
 
-Built on [leanEthereum/leanMultisig](https://github.com/leanEthereum/leanMultisig)'s minimal zkVM (WHIR + SuperSpartan, KoalaBear field, native Poseidon16 precompile).
+### 1. FFT + Merkle (baseline)
+
+Prove the coset FFT and Merkle tree construction directly in-circuit. Simple but expensive: O(n log n) multiplications, unrolled into millions of program lines for large n.
 
 ```bash
 cd leanvm
-cargo run --release --example fft_merkle_bench -- --log-n 8
-cargo test --example fft_merkle_bench --release  # 23 tests
+cargo run --release --example bench_fft_unroll -- --log-n 12
 ```
 
-### `stwo/` — reference
+### 2. Syndrome check
 
-Cairo 2.18 circuit proven with Stwo (Circle STARKs, Stark252 field, Blake2s hashing).
+Instead of proving the FFT, verify RS membership via syndrome checking: for random beta, check that the batched syndrome sum is zero. O(n) multiplications per check, 4 checks for 80-bit security. Supports chunked parallel proving with shared bytecode.
 
 ```bash
-cd stwo
-scarb cairo-test          # 11 tests
-scarb execute --arguments-file <args.json>
-python3 scripts/bench.py  # full benchmark with proving
+cargo run --release --example bench_syndrome_unroll -- --log-n 12
+cargo run --release --example bench_chunked -- --log-n 22 --log-chunk 12 --concurrency 8
+```
+
+### 3. RLC + fold (fastest)
+
+Batch m codewords via Random Linear Combination using extension-field precompiles (`dot_product_be`), then fold with random challenges (`dot_product_ee` + `add_ee`). Inspired by the leanDAS/STARS paper's approach of mapping bulk computation to precompile calls.
+
+```bash
+# Single proof (m=510 saturates 2^21 ext-op table)
+cargo run --release --example bench_fri_fold -- --log-poly 11 --m 510
+
+# Parallel batches
+cargo run --release --example bench_fri_fold -- --log-poly 11 --m 510 --batches 4 --concurrency 4
+
+# Larger proofs (ext-op table bumped to 2^23)
+cargo run --release --example bench_fri_fold -- --log-poly 11 --m 2046
+```
+
+## Recursive aggregation
+
+The syndrome approach includes a full recursive pipeline: prove leaf chunks in parallel, then aggregate via in-circuit WHIR proof verification (`recursion.py`).
+
+```bash
+cargo run --release --example bench_recursive -- --log-n 22 --arity 8
 ```
 
 ## Benchmarks
 
-Coset FFT + Merkle commitment, k=1 blowup:
+All results on AWS Graviton4 (c8g.8xlarge, 32 cores, 64 GB RAM).
 
-| n | payload | leanVM prove (Graviton3) | leanVM proof | Stwo prove | Stwo proof |
-|---|---------|--------------------------|--------------|------------|------------|
-| 8 | 1 KB | 0.08s | 184 KB | 32s | 1.09 MB |
-| 10 | 4 KB | 0.17s | 251 KB | 41s | 1.09 MB |
-| 12 | 16 KB | 0.80s | 280 KB | 84s | 1.18 MB |
-| 14 | 64 KB | 1.0s | 313 KB | 270s | 1.27 MB |
-| 16 | 256 KB | 3.8s | 362 KB | — | — |
-| 18 | 1 MB | 14s | 415 KB | — | — |
+### Single-proof throughput
 
-leanVM is ~100x faster and produces ~4x smaller proofs, primarily due to the native Poseidon16 precompile (one AIR row per hash vs hundreds for Blake2s).
+| Approach | Config | Prove | Data | Throughput |
+|---|---|---|---|---|
+| Syndrome (unrolled) | n=12 | 0.64s | 16 KB | 25 KB/s |
+| RLC+fold | m=510, n=4096 | 3.7s | 4.0 MB | 1,037 KB/s |
+| RLC+fold | m=1022, n=4096 | 7.5s | 8.0 MB | 1,097 KB/s |
+| RLC+fold | m=2046, n=4096 | 15.0s | 16.0 MB | 1,088 KB/s |
+
+### Parallel proving (RLC+fold, m=510)
+
+| Concurrency | Batches | Data | Prove wall | Throughput |
+|---|---|---|---|---|
+| 1 | 4 | 16 MB | 14.9s | 1,094 KB/s |
+| 2 | 4 | 16 MB | 12.7s | 1,284 KB/s |
+| 4 | 4 | 16 MB | 11.6s | 1,393 KB/s |
+| 4 | 8 | 33 MB | 23.2s | 1,407 KB/s |
+
+### 16 MB payload strategies
+
+| Strategy | Proofs | Prove wall | Agg proofs needed |
+|---|---|---|---|
+| 1 x m=2046 | 1 | 15.0s | 0 |
+| 2 x m=1022 c=2 | 2 | 12.9s | 1 |
+| 4 x m=510 c=4 | 4 | 11.6s | ~3 |
+
+### Historical: syndrome recursive pipeline (16 MB)
+
+| Phase | Time |
+|---|---|
+| Leaf proving (1024 proofs, c=8) | 257s |
+| Aggregation (1024 proofs, c=8) | 167s |
+| **Total** | **425s (38 KB/s)** |
+
+The RLC+fold approach is **37x faster** than the syndrome recursive pipeline.
+
+## Implementation
+
+Built on [leanEthereum/leanMultisig](https://github.com/leanEthereum/leanMultisig)'s minimal zkVM:
+- WHIR + SuperSpartan proving system
+- KoalaBear field (p = 2^31 - 2^24 + 1), quintic extension (|E| ~ 2^155)
+- Native Poseidon16 precompile
+- Extension-field precompiles: `dot_product_be`, `dot_product_ee`, `add_ee`
+
+### Key files
+
+| File | Description |
+|---|---|
+| `examples/bench_fri_fold.rs` | RLC+fold benchmark (parallel batching) |
+| `examples/bench_syndrome_unroll.rs` | Unrolled syndrome check |
+| `examples/bench_recursive.rs` | Full recursive pipeline |
+| `examples/bench_chunked.rs` | Chunked parallel syndrome |
+| `src/lib.rs` | Shared infrastructure (CircuitParams, reference computations, codegen helpers) |
+| `crates/rec_aggregation/` | Recursive proof aggregation (recursion.py, dal_main.py) |
+
+### Extension-op table limit
+
+The ext-op table is capped (default 2^21, bumped to 2^23 in this repo). Data per proof ~ 2 x ext_op_rows bytes, so the cap directly determines max payload per proof. The commitment surface budget (2^30 total) permits up to 2^23.
 
 ## Why "the dumb way"
 
