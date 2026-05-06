@@ -314,12 +314,12 @@ fn main() {
                 .unzip();
 
             // Build hints
-            let preamble_len = {
-                // From hashing.py: PREAMBLE_MEMORY_END - PUBLIC_INPUT_LEN
-                // ZERO_VEC_LEN + DIGEST_LEN + DIM + NUM_REPEATED_ONES
-                // These are compile-time, hard to compute exactly here. Use a reasonable default.
-                256 // generous preamble
-            };
+            // From hashing.py: PREAMBLE_MEMORY_END = REPEATED_ONES_PTR + NUM_REPEATED_ONES
+            // = (PUBLIC_INPUT_LEN + ZERO_VEC_LEN + DIGEST_LEN + DIM) + NUM_REPEATED_ONES
+            // = (8 + 16 + 8 + 5) + 32 = 69
+            // PREAMBLE_MEMORY_LEN = 69 - PUBLIC_INPUT_LEN = 69 - 8 = 61
+            // Our DAL circuit doesn't use tweak tables, so this is smaller than XMSS's.
+            let preamble_len = 61;
 
             let mut agg_hints: HashMap<String, Vec<Vec<F>>> = HashMap::new();
             agg_hints.insert("input_data".to_string(), vec![input_data]);
