@@ -94,9 +94,13 @@ fn main() {
     // Step 4: Prove all leaves
     eprintln!("[4] Proving {n_leaves} leaf proofs...");
     let t0 = Instant::now();
-    let leaf_proofs: Vec<_> = (0..n_leaves)
-        .into_par_iter()
-        .map(|ci| {
+    // Batch leaf proving with controlled concurrency — unbounded par_iter
+    // thrashes cache when the WHIR prover's internal rayon competes with outer parallelism.
+    let concurrency = 8; // optimal from bench_chunked sweep on G4
+    let mut leaf_proofs = Vec::with_capacity(n_leaves);
+    for batch_start in (0..n_leaves).step_by(concurrency) {
+        let batch_end = (batch_start + concurrency).min(n_leaves);
+        let batch: Vec<_> = (batch_start..batch_end).into_par_iter().map(|ci| {
             let offset = ci * leaf_n_eval;
             let chunk_evals = evals[offset..offset + leaf_n_eval].to_vec();
 
@@ -157,8 +161,9 @@ fn main() {
             ).unwrap_or_else(|e| panic!("leaf {ci} failed: {e}"));
 
             (proof, subtree_root, partial_sums, leaf_data)
-        })
-        .collect();
+        }).collect();
+        leaf_proofs.extend(batch);
+    }
     let leaf_time = t0.elapsed();
     let leaf_cycles: usize = leaf_proofs.iter().map(|(p, _, _, _)| p.metadata.cycles).sum();
     eprintln!("    {:.3}s wall, {} total cycles", leaf_time.as_secs_f64(), leaf_cycles);
