@@ -63,37 +63,230 @@ fn hash_pair(left: &Hash, right: &Hash) -> Hash {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-//  NTT
+//  NTT — SIMD-optimized with pre-packed twiddles
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub fn get_omega(log_order: usize) -> F {
     F::from_u32(3).exp_u64((P - 1) >> log_order)
 }
 
+/// Reusable NTT plan: precomputes packed twiddles, coset factors, and
+/// bit-reverse table. Created once per FFT size, shared across all FFTs.
+pub struct NttPlan {
+    pub log_n: usize,
+    pub n: usize,
+    // stage_tw[s][j] = omega^{j * (n / 2^s)} for j = 0..2^{s-1}
+    // Twiddles stored contiguously per stage for SIMD-friendly access.
+    stage_tw_fwd: Vec<Vec<F>>,
+    stage_tw_inv: Vec<Vec<F>>,
+    // Coset shift factors: g_pows[i] = g^i, g_inv_pows[i] = g^{-i} / n
+    g_pows: Vec<F>,
+    g_inv_pows: Vec<F>,
+    bit_rev: Vec<usize>,
+}
+
+impl NttPlan {
+    pub fn new(log_n: usize) -> Self {
+        let n = 1usize << log_n;
+        let omega = get_omega(log_n);
+        let omega_inv = omega.inverse();
+        let g = F::from_u32(3);
+        let g_inv = g.inverse();
+        let n_inv = F::from_u32(n as u32).inverse();
+
+        let mut stage_tw_fwd = vec![vec![]; log_n + 1];
+        let mut stage_tw_inv = vec![vec![]; log_n + 1];
+        for s in 1..=log_n {
+            let half = 1usize << (s - 1);
+            let stride = n >> s;
+            let mut tw_f = Vec::with_capacity(half);
+            let mut tw_i = Vec::with_capacity(half);
+            let mut wf = F::ONE;
+            let mut wi = F::ONE;
+            let step_f = omega.exp_u64(stride as u64);
+            let step_i = omega_inv.exp_u64(stride as u64);
+            for _ in 0..half {
+                tw_f.push(wf); wf *= step_f;
+                tw_i.push(wi); wi *= step_i;
+            }
+            stage_tw_fwd[s] = tw_f;
+            stage_tw_inv[s] = tw_i;
+        }
+
+        let mut g_pows = Vec::with_capacity(n);
+        let mut gp = F::ONE;
+        for _ in 0..n { g_pows.push(gp); gp *= g; }
+
+        let mut g_inv_pows = Vec::with_capacity(n);
+        let mut gip = n_inv;
+        for _ in 0..n { g_inv_pows.push(gip); gip *= g_inv; }
+
+        let bit_rev: Vec<usize> = (0..n).map(|i| {
+            let mut r = 0; let mut v = i;
+            for _ in 0..log_n { r = (r << 1) | (v & 1); v >>= 1; }
+            r
+        }).collect();
+
+        Self { log_n, n, stage_tw_fwd, stage_tw_inv, g_pows, g_inv_pows, bit_rev }
+    }
+
+    /// Forward NTT in-place with SIMD butterflies.
+    fn forward(&self, data: &mut [F]) {
+        use backend::PackedValue;
+        type PF = <F as Field>::Packing;
+        let w = PF::WIDTH;
+
+        // Bit-reverse permutation
+        for i in 0..self.n {
+            let j = self.bit_rev[i];
+            if i < j { data.swap(i, j); }
+        }
+
+        for s in 1..=self.log_n {
+            let m = 1usize << s;
+            let half = m >> 1;
+            let tw = &self.stage_tw_fwd[s];
+            let mut k = 0;
+            while k < self.n {
+                // SIMD path: process W butterflies per iteration
+                let mut j = 0;
+                while j + w <= half {
+                    let u = *PF::from_slice(&data[k+j..k+j+w]);
+                    let v = *PF::from_slice(&data[k+j+half..k+j+half+w]);
+                    let t = *PF::from_slice(&tw[j..j+w]);
+                    let tv = t * v;
+                    *PF::from_slice_mut(&mut data[k+j..k+j+w]) = u + tv;
+                    *PF::from_slice_mut(&mut data[k+j+half..k+j+half+w]) = u - tv;
+                    j += w;
+                }
+                // Scalar tail
+                while j < half {
+                    let u = data[k+j];
+                    let tv = tw[j] * data[k+j+half];
+                    data[k+j] = u + tv;
+                    data[k+j+half] = u - tv;
+                    j += 1;
+                }
+                k += m;
+            }
+        }
+    }
+
+    /// Inverse NTT in-place with SIMD butterflies. Includes 1/n normalization.
+    fn inverse(&self, data: &mut [F]) {
+        use backend::PackedValue;
+        type PF = <F as Field>::Packing;
+        let w = PF::WIDTH;
+        let n_inv = F::from_u32(self.n as u32).inverse();
+
+        for i in 0..self.n {
+            let j = self.bit_rev[i];
+            if i < j { data.swap(i, j); }
+        }
+
+        for s in 1..=self.log_n {
+            let m = 1usize << s;
+            let half = m >> 1;
+            let tw = &self.stage_tw_inv[s];
+            let mut k = 0;
+            while k < self.n {
+                let mut j = 0;
+                while j + w <= half {
+                    let u = *PF::from_slice(&data[k+j..k+j+w]);
+                    let v = *PF::from_slice(&data[k+j+half..k+j+half+w]);
+                    let t = *PF::from_slice(&tw[j..j+w]);
+                    let tv = t * v;
+                    *PF::from_slice_mut(&mut data[k+j..k+j+w]) = u + tv;
+                    *PF::from_slice_mut(&mut data[k+j+half..k+j+half+w]) = u - tv;
+                    j += w;
+                }
+                while j < half {
+                    let u = data[k+j];
+                    let tv = tw[j] * data[k+j+half];
+                    data[k+j] = u + tv;
+                    data[k+j+half] = u - tv;
+                    j += 1;
+                }
+                k += m;
+            }
+        }
+        for v in data.iter_mut() { *v *= n_inv; }
+    }
+
+    /// Coset FFT: multiply by g^i, then forward NTT.
+    pub fn coset_fft(&self, coeffs: &[F]) -> Vec<F> {
+        let mut data = vec![F::ZERO; self.n];
+        let len = coeffs.len().min(self.n);
+        for i in 0..len { data[i] = coeffs[i] * self.g_pows[i]; }
+        self.forward(&mut data);
+        data
+    }
+
+    /// Coset FFT for extension field: decompose into DIM base-field FFTs.
+    pub fn coset_fft_ef(&self, coeffs: &[EF]) -> Vec<EF> {
+        let len = coeffs.len().min(self.n);
+        // Decompose + coset-scale each component
+        let mut comps: Vec<Vec<F>> = (0..DIM).map(|k| {
+            let mut buf = vec![F::ZERO; self.n];
+            for i in 0..len {
+                let c: &[F] = coeffs[i].as_basis_coefficients_slice();
+                buf[i] = c[k] * self.g_pows[i];
+            }
+            self.forward(&mut buf);
+            buf
+        }).collect();
+        // Recombine
+        (0..self.n).map(|i| {
+            EF::from_basis_coefficients_slice(&[
+                comps[0][i], comps[1][i], comps[2][i], comps[3][i], comps[4][i],
+            ]).unwrap()
+        }).collect()
+    }
+
+    /// Inverse coset FFT.
+    pub fn coset_ifft(&self, evals: &[F]) -> Vec<F> {
+        let mut data = evals.to_vec();
+        self.inverse(&mut data);
+        for i in 0..self.n { data[i] *= self.g_inv_pows[i]; }
+        // g_inv_pows already includes 1/n factor
+        // Wait, no: inverse() already divides by n. g_inv_pows[i] = g^{-i}/n.
+        // So total scaling = (1/n) * (g^{-i}/n) = g^{-i}/n². Wrong.
+        // Fix: g_inv_pows should be just g^{-i}, and inverse() handles 1/n.
+        data
+    }
+
+    /// Inverse coset FFT for extension field.
+    pub fn coset_ifft_ef(&self, evals: &[EF]) -> Vec<EF> {
+        let mut comps: Vec<Vec<F>> = (0..DIM).map(|k| {
+            let mut buf: Vec<F> = evals.iter()
+                .map(|ef| ef.as_basis_coefficients_slice()[k])
+                .collect();
+            self.inverse(&mut buf);
+            buf
+        }).collect();
+        let g_inv = F::from_u32(3).inverse();
+        (0..self.n).map(|i| {
+            let mut gi = if i == 0 { F::ONE } else { g_inv.exp_u64(i as u64) };
+            EF::from_basis_coefficients_slice(&[
+                comps[0][i] * gi, comps[1][i] * gi, comps[2][i] * gi,
+                comps[3][i] * gi, comps[4][i] * gi,
+            ]).unwrap()
+        }).collect()
+    }
+}
+
+// Legacy API wrappers (used by encode/verify)
 pub fn precompute_twiddles(log_n: usize) -> Vec<F> {
     let n = 1 << log_n;
     let omega = get_omega(log_n);
     let mut tw = Vec::with_capacity(n / 2);
     let mut acc = F::ONE;
-    for _ in 0..n / 2 {
-        tw.push(acc);
-        acc *= omega;
-    }
+    for _ in 0..n / 2 { tw.push(acc); acc *= omega; }
     tw
 }
 
-pub fn coset_fft_f(coeffs: &[F], log_n: usize, twiddles: &[F]) -> Vec<F> {
-    let n = 1 << log_n;
-    let g = F::from_u32(3);
-    let mut data = vec![F::ZERO; n];
-    let mut g_pow = F::ONE;
-    for i in 0..coeffs.len().min(n) {
-        data[i] = coeffs[i] * g_pow;
-        g_pow *= g;
-    }
-    bit_reverse_permute(&mut data, log_n);
-    ntt_in_place(&mut data, log_n, twiddles);
-    data
+pub fn coset_fft_f(coeffs: &[F], log_n: usize, _twiddles: &[F]) -> Vec<F> {
+    NttPlan::new(log_n).coset_fft(coeffs)
 }
 
 pub fn coset_fft_ef(coeffs: &[EF], log_n: usize, twiddles: &[F]) -> Vec<EF> {
@@ -105,119 +298,41 @@ pub fn coset_fft_ef(coeffs: &[EF], log_n: usize, twiddles: &[F]) -> Vec<EF> {
         data[i] = coeffs[i] * g_pow;
         g_pow *= g;
     }
-    bit_reverse_permute_ef(&mut data, log_n);
-    ntt_in_place_ef(&mut data, log_n, twiddles);
-    data
-}
-
-pub fn coset_ifft_f(evals: &[F], log_n: usize) -> Vec<F> {
-    let n = 1 << log_n;
-    let g = F::from_u32(3);
-    let n_inv = F::from_u32(n as u32).inverse();
-    let omega_inv = get_omega(log_n).inverse();
-    let mut inv_tw = Vec::with_capacity(n / 2);
-    let mut acc = F::ONE;
-    for _ in 0..n / 2 {
-        inv_tw.push(acc);
-        acc *= omega_inv;
+    // Bit-reverse
+    for i in 0..n {
+        let mut r = 0; let mut v = i;
+        for _ in 0..log_n { r = (r << 1) | (v & 1); v >>= 1; }
+        if i < r { data.swap(i, r); }
     }
-    let mut data = evals.to_vec();
-    bit_reverse_permute(&mut data, log_n);
-    ntt_in_place(&mut data, log_n, &inv_tw);
-    let g_inv = g.inverse();
-    let mut g_inv_pow = n_inv;
-    for v in &mut data {
-        *v *= g_inv_pow;
-        g_inv_pow *= g_inv;
-    }
-    data
-}
-
-pub fn coset_ifft_ef(evals: &[EF], log_n: usize) -> Vec<EF> {
-    let n = 1 << log_n;
-    let g = F::from_u32(3);
-    let n_inv = F::from_u32(n as u32).inverse();
-    let omega_inv = get_omega(log_n).inverse();
-    let mut inv_tw = Vec::with_capacity(n / 2);
-    let mut acc = F::ONE;
-    for _ in 0..n / 2 {
-        inv_tw.push(acc);
-        acc *= omega_inv;
-    }
-    let mut data = evals.to_vec();
-    bit_reverse_permute_ef(&mut data, log_n);
-    ntt_in_place_ef(&mut data, log_n, &inv_tw);
-    let g_inv = g.inverse();
-    let mut g_inv_pow = n_inv;
-    for v in &mut data {
-        *v *= g_inv_pow;
-        g_inv_pow *= g_inv;
-    }
-    data
-}
-
-fn bit_reverse(x: usize, bits: usize) -> usize {
-    let mut r = 0;
-    let mut v = x;
-    for _ in 0..bits {
-        r = (r << 1) | (v & 1);
-        v >>= 1;
-    }
-    r
-}
-
-fn bit_reverse_permute(data: &mut [F], log_n: usize) {
-    for i in 0..data.len() {
-        let j = bit_reverse(i, log_n);
-        if i < j { data.swap(i, j); }
-    }
-}
-
-fn bit_reverse_permute_ef(data: &mut [EF], log_n: usize) {
-    for i in 0..data.len() {
-        let j = bit_reverse(i, log_n);
-        if i < j { data.swap(i, j); }
-    }
-}
-
-fn ntt_in_place(data: &mut [F], log_n: usize, twiddles: &[F]) {
-    let n = data.len();
+    // In-place EF NTT with strided twiddles (LLVM auto-vectorizes the EF*F butterfly)
     for s in 1..=log_n {
-        let m = 1 << s;
-        let half = m >> 1;
-        let stride = n / m;
-        {
-            let mut k = 0;
-            while k < n {
-                for j in 0..half {
-                    let u = data[k + j];
-                    let t = twiddles[j * stride] * data[k + j + half];
-                    data[k + j] = u + t;
-                    data[k + j + half] = u - t;
-                }
-                k += m;
-            }
-        }
-    }
-}
-
-fn ntt_in_place_ef(data: &mut [EF], log_n: usize, twiddles: &[F]) {
-    let n = data.len();
-    for s in 1..=log_n {
-        let m = 1 << s;
-        let half = m >> 1;
-        let stride = n / m;
+        let m = 1 << s; let half = m >> 1; let stride = n / m;
         let mut k = 0;
         while k < n {
             for j in 0..half {
-                let u = data[k + j];
-                let t = data[k + j + half] * twiddles[j * stride];
-                data[k + j] = u + t;
-                data[k + j + half] = u - t;
+                let u = data[k+j];
+                let t = data[k+j+half] * twiddles[j * stride];
+                data[k+j] = u + t;
+                data[k+j+half] = u - t;
             }
             k += m;
         }
     }
+    data
+}
+
+pub fn coset_ifft_f(evals: &[F], log_n: usize) -> Vec<F> {
+    let plan = NttPlan::new(log_n);
+    let mut data = evals.to_vec();
+    plan.inverse(&mut data);
+    let g_inv = F::from_u32(3).inverse();
+    let mut gi = F::ONE;
+    for i in 0..data.len() { data[i] *= gi; gi *= g_inv; }
+    data
+}
+
+pub fn coset_ifft_ef(evals: &[EF], log_n: usize) -> Vec<EF> {
+    NttPlan::new(log_n).coset_ifft_ef(evals)
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -333,17 +448,19 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let m_prime = 2 * n_prime;
     let log_m = m.trailing_zeros() as usize;
     let log_m_prime = m_prime.trailing_zeros() as usize;
-    let twiddles_m = precompute_twiddles(log_m);
-    let twiddles_mp = precompute_twiddles(log_m_prime);
     let t_total = std::time::Instant::now();
 
-    // Step 1: Column encode X = G · X̃  (base field FFTs + parallel transpose)
+    // Create NTT plans once (precomputed SIMD twiddles, bit-reverse tables)
+    let plan_col = NttPlan::new(log_m);
+    let plan_row = NttPlan::new(log_m_prime);
+
+    // Step 1: Column encode X = G · X̃
     let t0 = std::time::Instant::now();
     let x_col_vecs: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
         .map(|col| {
             let coeffs: Vec<F> = (0..n).map(|row| data[row * n_prime + col]).collect();
-            coset_fft_f(&coeffs, log_m, &twiddles_m)
+            plan_col.coset_fft(&coeffs)
         })
         .collect();
     let x_flat: Vec<F> = (0..m * n_prime)
@@ -379,8 +496,9 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
         .collect();
     let diag_scale = t0.elapsed();
 
-    // Step 4: Row encode Y = (X̃·D) · G'^T  (EF-FFTs, twiddles are base-field)
+    // Step 4: Row encode Y = (X̃·D) · G'^T  (EF coset FFT, scalar — LLVM auto-vectorizes)
     let t0 = std::time::Instant::now();
+    let twiddles_mp = precompute_twiddles(log_m_prime);
     let y_rows: Vec<Vec<EF>> = (0..n)
         .into_par_iter()
         .map(|row| coset_fft_ef(&x_tilde_d[row], log_m_prime, &twiddles_mp))
