@@ -297,7 +297,7 @@ pub struct ZodaEncoding {
     pub root_y: Hash,
     pub tree_x: MerkleTree,
     pub tree_y: MerkleTree,
-    pub x: Vec<Vec<F>>,        // m rows × n' cols, base field
+    pub x_flat: Vec<F>,        // m × n', row-major flat
     pub y: Vec<Vec<EF>>,       // n rows × m' cols, extension field
     pub diag: Vec<EF>,
     pub n: usize,
@@ -324,7 +324,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let twiddles_mp = precompute_twiddles(log_m_prime);
     let t_total = std::time::Instant::now();
 
-    // Step 1: Column encode X = G · X̃  (base field FFTs)
+    // Step 1: Column encode X = G · X̃  (base field FFTs + parallel transpose)
     let t0 = std::time::Instant::now();
     let x_col_vecs: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
@@ -333,33 +333,40 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
             coset_fft_f(&coeffs, log_m, &twiddles_m)
         })
         .collect();
-    let x_rows: Vec<Vec<F>> = (0..m)
+    let x_flat: Vec<F> = (0..m * n_prime)
         .into_par_iter()
-        .map(|i| (0..n_prime).map(|col| x_col_vecs[col][i]).collect())
+        .map(|idx| x_col_vecs[idx % n_prime][idx / n_prime])
         .collect();
+    drop(x_col_vecs);
     let col_fft = t0.elapsed();
 
-    // Step 2: Commit to rows of X  (BLAKE3 Merkle)
+    // Step 2: Commit to rows of X  (BLAKE3 Merkle, bulk hash)
     let t0 = std::time::Instant::now();
-    let x_leaves: Vec<Hash> = x_rows.par_iter().map(|row| hash_f_slice(row)).collect();
+    let x_leaves: Vec<Hash> = (0..m)
+        .into_par_iter()
+        .map(|i| hash_f_slice(&x_flat[i * n_prime..(i + 1) * n_prime]))
+        .collect();
     let tree_x = MerkleTree::from_leaves(x_leaves);
     let root_x = tree_x.root();
     let commit_x = t0.elapsed();
 
-    // Step 3: Diagonal scale X̃·D  (F → EF promotion + EF mul)
+    // Step 3: Diagonal scale X̃·D  (F * EF → EF, per element)
     let t0 = std::time::Instant::now();
     let diag = derive_diagonal(&root_x, n_prime);
     let x_tilde_d: Vec<Vec<EF>> = (0..n)
         .into_par_iter()
         .map(|row| {
-            (0..n_prime)
-                .map(|col| EF::from(data[row * n_prime + col]) * diag[col])
+            let row_data = &data[row * n_prime..(row + 1) * n_prime];
+            row_data
+                .iter()
+                .enumerate()
+                .map(|(col, &x)| EF::from(x) * diag[col])
                 .collect()
         })
         .collect();
     let diag_scale = t0.elapsed();
 
-    // Step 4: Row encode Y = (X̃·D) · G'^T  (extension field FFTs)
+    // Step 4: Row encode Y = (X̃·D) · G'^T  (EF-FFTs, twiddles are base-field)
     let t0 = std::time::Instant::now();
     let y_rows: Vec<Vec<EF>> = (0..n)
         .into_par_iter()
@@ -392,7 +399,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     ZodaEncoding {
         root_x, root_y,
         tree_x, tree_y,
-        x: x_rows, y: y_rows,
+        x_flat, y: y_rows,
         diag, n, n_prime, m, m_prime,
         timing: EncodeTiming { col_fft, commit_x, diag_scale, row_fft, commit_y, total },
     }
@@ -437,11 +444,18 @@ pub struct YColOpening {
 
 impl ZodaEncoding {
     pub fn open_x_row(&self, i: usize) -> XRowOpening {
+        let start = i * self.n_prime;
         XRowOpening {
             row_index: i,
-            data: self.x[i].clone(),
+            data: self.x_flat[start..start + self.n_prime].to_vec(),
             proof: self.tree_x.open(i),
         }
+    }
+
+    /// Get row i of X as a slice (zero-copy).
+    pub fn x_row(&self, i: usize) -> &[F] {
+        let start = i * self.n_prime;
+        &self.x_flat[start..start + self.n_prime]
     }
 
     pub fn open_y_col(&self, j: usize) -> YColOpening {
@@ -550,13 +564,13 @@ pub fn verify(
 //  Decoding (paper §3.1.3)
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub fn decode_from_x_rows(x_rows: &[Vec<F>], n: usize, n_prime: usize) -> Vec<F> {
-    let m = x_rows.len();
+/// Decode X̃ from X (row-major flat buffer, m × n').
+pub fn decode_from_x_flat(x_flat: &[F], m: usize, n: usize, n_prime: usize) -> Vec<F> {
     let log_m = m.trailing_zeros() as usize;
     let decoded_cols: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
         .map(|col| {
-            let evals: Vec<F> = (0..m).map(|row| x_rows[row][col]).collect();
+            let evals: Vec<F> = (0..m).map(|row| x_flat[row * n_prime + col]).collect();
             let coeffs = coset_ifft_f(&evals, log_m);
             coeffs[..n].to_vec()
         })
