@@ -263,7 +263,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let plan_col = NttPlan::new(m.trailing_zeros() as usize);
     let plan_row = NttPlan::new(m_prime.trailing_zeros() as usize);
 
-    // Step 1: Column encode X = G · X̃ (negacyclic NTT, no coset scaling)
+    // Step 1: Column encode X = G · X̃ (per-FFT allocation, parallel)
     let t0 = std::time::Instant::now();
     let x_col_vecs: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
@@ -272,7 +272,6 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
             plan_col.fwd_poly(&coeffs)
         })
         .collect();
-    // Transpose to row-major
     let x_flat: Vec<F> = (0..m * n_prime)
         .into_par_iter()
         .map(|idx| x_col_vecs[idx % n_prime][idx / n_prime])
@@ -304,7 +303,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
         .collect();
     let diag_scale = t0.elapsed();
 
-    // Step 4: Row encode Y = (X̃·D) · G'^T (EF via 5 decomposed base-field NTTs)
+    // Step 4: Row encode Y = (X̃·D) · G'^T (EF via per-FFT 5-way decompose)
     let t0 = std::time::Instant::now();
     let y_rows: Vec<Vec<EF>> = (0..n)
         .into_par_iter()
