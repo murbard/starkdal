@@ -181,48 +181,12 @@ fn bit_reverse_permute_ef(data: &mut [EF], log_n: usize) {
 }
 
 fn ntt_in_place(data: &mut [F], log_n: usize, twiddles: &[F]) {
-    use backend::PackedValue;
-    type PF = <F as Field>::Packing;
-    const W: usize = { PF::WIDTH };
-
     let n = data.len();
     for s in 1..=log_n {
         let m = 1 << s;
         let half = m >> 1;
         let stride = n / m;
-
-        if half >= W {
-            // Packed path: process W butterflies per iteration using SIMD
-            let mut k = 0;
-            while k < n {
-                let mut j = 0;
-                while j + W <= half {
-                    let u = PF::from_fn(|i| data[k + j + i]);
-                    let v = PF::from_fn(|i| data[k + j + half + i]);
-                    let w = PF::from_fn(|i| twiddles[(j + i) * stride]);
-                    let wv = w * v;
-                    let top = u + wv;
-                    let bot = u - wv;
-                    let top_s = top.as_slice();
-                    let bot_s = bot.as_slice();
-                    for i in 0..W {
-                        data[k + j + i] = top_s[i];
-                        data[k + j + half + i] = bot_s[i];
-                    }
-                    j += W;
-                }
-                // Scalar tail (if half not divisible by W)
-                while j < half {
-                    let u = data[k + j];
-                    let t = twiddles[j * stride] * data[k + j + half];
-                    data[k + j] = u + t;
-                    data[k + j + half] = u - t;
-                    j += 1;
-                }
-                k += m;
-            }
-        } else {
-            // Small stages: scalar
+        {
             let mut k = 0;
             while k < n {
                 for j in 0..half {
