@@ -23,25 +23,36 @@ pub type Hash = [u8; HASH_LEN];
 //  Hashing (BLAKE3)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Hash a slice of base-field elements — bulk serialize then single-shot hash.
+/// Hash a contiguous slice of base-field elements by raw memory representation.
+/// Avoids per-element Montgomery reduction — binding and deterministic within
+/// the same code (same field impl → same repr → same hash).
 fn hash_f_slice(data: &[F]) -> Hash {
-    let mut buf = Vec::with_capacity(data.len() * 4);
-    for &v in data {
-        buf.extend_from_slice(&v.as_canonical_u32().to_le_bytes());
-    }
-    *blake3::hash(&buf).as_bytes()
+    let bytes = unsafe {
+        std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * std::mem::size_of::<F>())
+    };
+    *blake3::hash(bytes).as_bytes()
 }
 
-/// Hash a slice of extension-field elements — bulk serialize then single-shot hash.
-fn hash_ef_slice(data: &[EF]) -> Hash {
-    let mut buf = Vec::with_capacity(data.len() * DIM * 4);
-    for ef in data {
-        let comps: &[F] = ef.as_basis_coefficients_slice();
-        for c in comps {
-            buf.extend_from_slice(&c.as_canonical_u32().to_le_bytes());
-        }
+/// Hash a gathered column of EF elements (non-contiguous → must serialize).
+fn hash_ef_column(y_rows: &[Vec<EF>], col: usize) -> Hash {
+    let n = y_rows.len();
+    // Gather column into contiguous buffer, then hash raw bytes
+    let mut buf: Vec<EF> = Vec::with_capacity(n);
+    for row in y_rows {
+        buf.push(row[col]);
     }
-    *blake3::hash(&buf).as_bytes()
+    let bytes = unsafe {
+        std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), buf.len() * std::mem::size_of::<EF>())
+    };
+    *blake3::hash(bytes).as_bytes()
+}
+
+/// Hash a contiguous slice of EF elements by raw memory representation.
+fn hash_ef_slice(data: &[EF]) -> Hash {
+    let bytes = unsafe {
+        std::slice::from_raw_parts(data.as_ptr().cast::<u8>(), data.len() * std::mem::size_of::<EF>())
+    };
+    *blake3::hash(bytes).as_bytes()
 }
 
 fn hash_pair(left: &Hash, right: &Hash) -> Hash {
@@ -378,17 +389,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let t0 = std::time::Instant::now();
     let y_leaves: Vec<Hash> = (0..m_prime)
         .into_par_iter()
-        .map(|col| {
-            // Gather column from row-major Y, serialize, bulk-hash
-            let mut buf = Vec::with_capacity(n * DIM * 4);
-            for row in 0..n {
-                let comps: &[F] = y_rows[row][col].as_basis_coefficients_slice();
-                for c in comps {
-                    buf.extend_from_slice(&c.as_canonical_u32().to_le_bytes());
-                }
-            }
-            *blake3::hash(&buf).as_bytes()
-        })
+        .map(|col| hash_ef_column(&y_rows, col))
         .collect();
     let tree_y = MerkleTree::from_leaves(y_leaves);
     let root_y = tree_y.root();
