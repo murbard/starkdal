@@ -283,23 +283,34 @@ impl MerkleProof {
 //  ZODA encoding
 // ═══════════════════════════════════════════════════════════════════════════
 
+pub struct EncodeTiming {
+    pub col_fft: std::time::Duration,
+    pub commit_x: std::time::Duration,
+    pub diag_scale: std::time::Duration,
+    pub row_fft: std::time::Duration,
+    pub commit_y: std::time::Duration,
+    pub total: std::time::Duration,
+}
+
 pub struct ZodaEncoding {
     pub root_x: Hash,
     pub root_y: Hash,
-    pub root_z: Hash,
     pub tree_x: MerkleTree,
     pub tree_y: MerkleTree,
-    pub tree_z: MerkleTree,
-    pub x: Vec<Vec<F>>,
-    pub y: Vec<Vec<EF>>,
-    pub z: Vec<Vec<EF>>,
+    pub x: Vec<Vec<F>>,        // m rows × n' cols, base field
+    pub y: Vec<Vec<EF>>,       // n rows × m' cols, extension field
     pub diag: Vec<EF>,
     pub n: usize,
     pub n_prime: usize,
     pub m: usize,
     pub m_prime: usize,
+    pub timing: EncodeTiming,
 }
 
+/// Encode data matrix X̃ (n × n', row-major flat Vec<F>) using ZODA.
+///
+/// Z = G·Y is NOT precomputed — individual Z entries are derived on-demand
+/// from Y columns during verification (the verifier computes (G·y_j)[i]).
 pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     assert_eq!(data.len(), n * n_prime);
     assert!(n.is_power_of_two() && n >= 8);
@@ -311,8 +322,10 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let log_m_prime = m_prime.trailing_zeros() as usize;
     let twiddles_m = precompute_twiddles(log_m);
     let twiddles_mp = precompute_twiddles(log_m_prime);
+    let t_total = std::time::Instant::now();
 
-    // Column encode X = G · X̃
+    // Step 1: Column encode X = G · X̃  (base field FFTs)
+    let t0 = std::time::Instant::now();
     let x_col_vecs: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
         .map(|col| {
@@ -324,16 +337,18 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
         .into_par_iter()
         .map(|i| (0..n_prime).map(|col| x_col_vecs[col][i]).collect())
         .collect();
+    let col_fft = t0.elapsed();
 
-    // Commit to rows of X
+    // Step 2: Commit to rows of X  (BLAKE3 Merkle)
+    let t0 = std::time::Instant::now();
     let x_leaves: Vec<Hash> = x_rows.par_iter().map(|row| hash_f_slice(row)).collect();
     let tree_x = MerkleTree::from_leaves(x_leaves);
     let root_x = tree_x.root();
+    let commit_x = t0.elapsed();
 
-    // Derive random diagonal D ∈ E^{n'} via Fiat-Shamir from root_x
+    // Step 3: Diagonal scale X̃·D  (F → EF promotion + EF mul)
+    let t0 = std::time::Instant::now();
     let diag = derive_diagonal(&root_x, n_prime);
-
-    // Scale X̃ by D
     let x_tilde_d: Vec<Vec<EF>> = (0..n)
         .into_par_iter()
         .map(|row| {
@@ -342,14 +357,18 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
                 .collect()
         })
         .collect();
+    let diag_scale = t0.elapsed();
 
-    // Row encode Y = (X̃·D) · G'^T
+    // Step 4: Row encode Y = (X̃·D) · G'^T  (extension field FFTs)
+    let t0 = std::time::Instant::now();
     let y_rows: Vec<Vec<EF>> = (0..n)
         .into_par_iter()
         .map(|row| coset_fft_ef(&x_tilde_d[row], log_m_prime, &twiddles_mp))
         .collect();
+    let row_fft = t0.elapsed();
 
-    // Commit to columns of Y
+    // Step 5: Commit to columns of Y  (BLAKE3 Merkle, EF data)
+    let t0 = std::time::Instant::now();
     let y_leaves: Vec<Hash> = (0..m_prime)
         .into_par_iter()
         .map(|col| {
@@ -359,30 +378,16 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
         .collect();
     let tree_y = MerkleTree::from_leaves(y_leaves);
     let root_y = tree_y.root();
+    let commit_y = t0.elapsed();
 
-    // Full encode Z = G · Y
-    let z_col_vecs: Vec<Vec<EF>> = (0..m_prime)
-        .into_par_iter()
-        .map(|col| {
-            let y_col: Vec<EF> = (0..n).map(|row| y_rows[row][col]).collect();
-            coset_fft_ef(&y_col, log_m, &twiddles_m)
-        })
-        .collect();
-    let z_rows: Vec<Vec<EF>> = (0..m)
-        .into_par_iter()
-        .map(|i| (0..m_prime).map(|col| z_col_vecs[col][i]).collect())
-        .collect();
-
-    // Commit to rows of Z
-    let z_leaves: Vec<Hash> = z_rows.par_iter().map(|row| hash_ef_slice(row)).collect();
-    let tree_z = MerkleTree::from_leaves(z_leaves);
-    let root_z = tree_z.root();
+    let total = t_total.elapsed();
 
     ZodaEncoding {
-        root_x, root_y, root_z,
-        tree_x, tree_y, tree_z,
-        x: x_rows, y: y_rows, z: z_rows,
+        root_x, root_y,
+        tree_x, tree_y,
+        x: x_rows, y: y_rows,
         diag, n, n_prime, m, m_prime,
+        timing: EncodeTiming { col_fft, commit_x, diag_scale, row_fft, commit_y, total },
     }
 }
 
@@ -423,14 +428,6 @@ pub struct YColOpening {
     pub proof: MerkleProof,
 }
 
-pub struct ZEntryOpening {
-    pub row: usize,
-    pub col: usize,
-    pub value: EF,
-    pub row_data: Vec<EF>,
-    pub proof: MerkleProof,
-}
-
 impl ZodaEncoding {
     pub fn open_x_row(&self, i: usize) -> XRowOpening {
         XRowOpening {
@@ -444,15 +441,6 @@ impl ZodaEncoding {
         let col_data: Vec<EF> = (0..self.n).map(|row| self.y[row][j]).collect();
         YColOpening { col_index: j, data: col_data, proof: self.tree_y.open(j) }
     }
-
-    pub fn open_z_entry(&self, i: usize, j: usize) -> ZEntryOpening {
-        ZEntryOpening {
-            row: i, col: j,
-            value: self.z[i][j],
-            row_data: self.z[i].clone(),
-            proof: self.tree_z.open(i),
-        }
-    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -462,18 +450,17 @@ impl ZodaEncoding {
 pub struct ZodaCommitment {
     pub root_x: Hash,
     pub root_y: Hash,
-    pub root_z: Hash,
     pub n: usize,
     pub n_prime: usize,
     pub m: usize,
     pub m_prime: usize,
-    pub diag: Vec<EF>,
+    pub diag: Vec<EF>,  // derivable from root_x
 }
 
 impl From<&ZodaEncoding> for ZodaCommitment {
     fn from(enc: &ZodaEncoding) -> Self {
         Self {
-            root_x: enc.root_x, root_y: enc.root_y, root_z: enc.root_z,
+            root_x: enc.root_x, root_y: enc.root_y,
             n: enc.n, n_prime: enc.n_prime, m: enc.m, m_prime: enc.m_prime,
             diag: enc.diag.clone(),
         }
@@ -483,24 +470,23 @@ impl From<&ZodaEncoding> for ZodaCommitment {
 pub struct VerifyResult {
     pub consistency_checks: usize,
     pub consistency_passed: usize,
-    pub z_checks: usize,
-    pub z_passed: usize,
     pub merkle_ok: bool,
 }
 
 impl VerifyResult {
     pub fn accept(&self) -> bool {
-        self.merkle_ok
-            && self.consistency_passed == self.consistency_checks
-            && self.z_passed == self.z_checks
+        self.merkle_ok && self.consistency_passed == self.consistency_checks
     }
 }
 
+/// Run the ZODA sampling verification protocol (paper §3.1.2).
+///
+/// Checks X_S · D · g'_j = (G · y_j)_S for each sampled row i and column j.
+/// Z entries are derived on-the-fly from Y columns (no Z commitment needed).
 pub fn verify(
     commitment: &ZodaCommitment,
     x_openings: &[XRowOpening],
     y_openings: &[YColOpening],
-    z_openings: &[ZEntryOpening],
 ) -> VerifyResult {
     let log_m_prime = commitment.m_prime.trailing_zeros() as usize;
     let omega_mp = get_omega(log_m_prime);
@@ -518,25 +504,20 @@ pub fn verify(
             merkle_ok = false;
         }
     }
-    for zo in z_openings {
-        let row_hash = hash_ef_slice(&zo.row_data);
-        if !zo.proof.verify(&row_hash, &commitment.root_z) { merkle_ok = false; }
-        if zo.row_data[zo.col] != zo.value { merkle_ok = false; }
-    }
 
     // Precompute G · y_j for each sampled column
     let log_m = commitment.m.trailing_zeros() as usize;
     let twiddles_m = precompute_twiddles(log_m);
-    let g_yj_cache: Vec<(usize, Vec<EF>)> = y_openings
+    let g_yj_cache: Vec<Vec<EF>> = y_openings
         .iter()
-        .map(|yo| (yo.col_index, coset_fft_ef(&yo.data, log_m, &twiddles_m)))
+        .map(|yo| coset_fft_ef(&yo.data, log_m, &twiddles_m))
         .collect();
 
-    // Step 5: X_S · D · g'_j = (G · y_j)_S
+    // Consistency check: X_S · D · g'_j = (G · y_j)_S
     let mut consistency_checks = 0usize;
     let mut consistency_passed = 0usize;
 
-    for (yo, (_j, g_yj)) in y_openings.iter().zip(&g_yj_cache) {
+    for (yo, g_yj) in y_openings.iter().zip(&g_yj_cache) {
         let eval_point = g * omega_mp.exp_u64(yo.col_index as u64);
         let ep_ef = EF::from(eval_point);
         let mut d_ep = Vec::with_capacity(commitment.n_prime);
@@ -555,17 +536,7 @@ pub fn verify(
         }
     }
 
-    // Step 6: Z_{ij} = (G · y_j)[i]
-    let mut z_checks = 0usize;
-    let mut z_passed = 0usize;
-    for zo in z_openings {
-        if let Some((_, g_yj)) = g_yj_cache.iter().find(|(col, _)| *col == zo.col) {
-            z_checks += 1;
-            if zo.value == g_yj[zo.row] { z_passed += 1; }
-        }
-    }
-
-    VerifyResult { consistency_checks, consistency_passed, z_checks, z_passed, merkle_ok }
+    VerifyResult { consistency_checks, consistency_passed, merkle_ok }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
