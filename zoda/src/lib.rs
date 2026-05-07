@@ -23,25 +23,25 @@ pub type Hash = [u8; HASH_LEN];
 //  Hashing (BLAKE3)
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Hash a slice of base-field elements (4 bytes each, little-endian).
+/// Hash a slice of base-field elements — bulk serialize then single-shot hash.
 fn hash_f_slice(data: &[F]) -> Hash {
-    let mut hasher = blake3::Hasher::new();
+    let mut buf = Vec::with_capacity(data.len() * 4);
     for &v in data {
-        hasher.update(&v.as_canonical_u32().to_le_bytes());
+        buf.extend_from_slice(&v.as_canonical_u32().to_le_bytes());
     }
-    *hasher.finalize().as_bytes()
+    *blake3::hash(&buf).as_bytes()
 }
 
-/// Hash a slice of extension-field elements (5 × 4 = 20 bytes each).
+/// Hash a slice of extension-field elements — bulk serialize then single-shot hash.
 fn hash_ef_slice(data: &[EF]) -> Hash {
-    let mut hasher = blake3::Hasher::new();
+    let mut buf = Vec::with_capacity(data.len() * DIM * 4);
     for ef in data {
         let comps: &[F] = ef.as_basis_coefficients_slice();
         for c in comps {
-            hasher.update(&c.as_canonical_u32().to_le_bytes());
+            buf.extend_from_slice(&c.as_canonical_u32().to_le_bytes());
         }
     }
-    *hasher.finalize().as_bytes()
+    *blake3::hash(&buf).as_bytes()
 }
 
 fn hash_pair(left: &Hash, right: &Hash) -> Hash {
@@ -372,8 +372,15 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let y_leaves: Vec<Hash> = (0..m_prime)
         .into_par_iter()
         .map(|col| {
-            let col_data: Vec<EF> = (0..n).map(|row| y_rows[row][col]).collect();
-            hash_ef_slice(&col_data)
+            // Gather column from row-major Y, serialize, bulk-hash
+            let mut buf = Vec::with_capacity(n * DIM * 4);
+            for row in 0..n {
+                let comps: &[F] = y_rows[row][col].as_basis_coefficients_slice();
+                for c in comps {
+                    buf.extend_from_slice(&c.as_canonical_u32().to_le_bytes());
+                }
+            }
+            *blake3::hash(&buf).as_bytes()
         })
         .collect();
     let tree_y = MerkleTree::from_leaves(y_leaves);
