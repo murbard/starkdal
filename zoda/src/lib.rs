@@ -181,37 +181,118 @@ fn bit_reverse_permute_ef(data: &mut [EF], log_n: usize) {
 }
 
 fn ntt_in_place(data: &mut [F], log_n: usize, twiddles: &[F]) {
+    use backend::PackedValue;
+    type PF = <F as Field>::Packing;
+    const W: usize = { PF::WIDTH };
+
     let n = data.len();
     for s in 1..=log_n {
         let m = 1 << s;
         let half = m >> 1;
         let stride = n / m;
-        let mut k = 0;
-        while k < n {
-            for j in 0..half {
-                let u = data[k + j];
-                let t = twiddles[j * stride] * data[k + j + half];
-                data[k + j] = u + t;
-                data[k + j + half] = u - t;
+
+        if half >= W {
+            // Packed path: process W butterflies per iteration using SIMD
+            let mut k = 0;
+            while k < n {
+                let mut j = 0;
+                while j + W <= half {
+                    let u = PF::from_fn(|i| data[k + j + i]);
+                    let v = PF::from_fn(|i| data[k + j + half + i]);
+                    let w = PF::from_fn(|i| twiddles[(j + i) * stride]);
+                    let wv = w * v;
+                    let top = u + wv;
+                    let bot = u - wv;
+                    let top_s = top.as_slice();
+                    let bot_s = bot.as_slice();
+                    for i in 0..W {
+                        data[k + j + i] = top_s[i];
+                        data[k + j + half + i] = bot_s[i];
+                    }
+                    j += W;
+                }
+                // Scalar tail (if half not divisible by W)
+                while j < half {
+                    let u = data[k + j];
+                    let t = twiddles[j * stride] * data[k + j + half];
+                    data[k + j] = u + t;
+                    data[k + j + half] = u - t;
+                    j += 1;
+                }
+                k += m;
             }
-            k += m;
+        } else {
+            // Small stages: scalar
+            let mut k = 0;
+            while k < n {
+                for j in 0..half {
+                    let u = data[k + j];
+                    let t = twiddles[j * stride] * data[k + j + half];
+                    data[k + j] = u + t;
+                    data[k + j + half] = u - t;
+                }
+                k += m;
+            }
         }
     }
 }
 
 fn ntt_in_place_ef(data: &mut [EF], log_n: usize, twiddles: &[F]) {
+    // EF * F twiddle decomposes into 5 independent base-field muls.
+    // We operate on the raw [F; 5] representation directly and use
+    // the packed base-field NTT for each component.
+    //
+    // data_flat[idx * DIM + k] = data[idx].component_k
     let n = data.len();
+    let data_flat: &mut [F] = unsafe {
+        std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<F>(), n * DIM)
+    };
+
+    use backend::PackedValue;
+    type PF = <F as Field>::Packing;
+    const W: usize = { PF::WIDTH };
+
     for s in 1..=log_n {
         let m = 1 << s;
         let half = m >> 1;
         let stride = n / m;
         let mut k = 0;
         while k < n {
-            for j in 0..half {
-                let u = data[k + j];
-                let t = data[k + j + half] * twiddles[j * stride];
-                data[k + j] = u + t;
-                data[k + j + half] = u - t;
+            if half >= W {
+                // Packed path: W EF butterflies = 5*W base-field butterflies
+                let mut j = 0;
+                while j + W <= half {
+                    let w = PF::from_fn(|i| twiddles[(j + i) * stride]);
+                    for comp in 0..DIM {
+                        let u = PF::from_fn(|i| data_flat[(k + j + i) * DIM + comp]);
+                        let v = PF::from_fn(|i| data_flat[(k + j + half + i) * DIM + comp]);
+                        let wv = w * v;
+                        let top = u + wv;
+                        let bot = u - wv;
+                        let top_s = top.as_slice();
+                        let bot_s = bot.as_slice();
+                        for i in 0..W {
+                            data_flat[(k + j + i) * DIM + comp] = top_s[i];
+                            data_flat[(k + j + half + i) * DIM + comp] = bot_s[i];
+                        }
+                    }
+                    j += W;
+                }
+                // Scalar tail
+                while j < half {
+                    let u = data[k + j];
+                    let t = data[k + j + half] * twiddles[j * stride];
+                    data[k + j] = u + t;
+                    data[k + j + half] = u - t;
+                    j += 1;
+                }
+            } else {
+                for j in 0..half {
+                    let u = data[k + j];
+                    let t = data[k + j + half] * twiddles[j * stride];
+                    data[k + j] = u + t;
+                    data[k + j + half] = u - t;
+                }
             }
             k += m;
         }
