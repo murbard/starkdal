@@ -164,7 +164,6 @@ pub struct EncodeTiming {
 pub struct ZodaEncoding {
     pub tree_rows: MerkleTree,   // commit Z by rows
     pub tree_cols: MerkleTree,   // commit Z by columns
-    pub z_row_major: Vec<F>,     // z_row_major[row * m' + col], m × m' base field
     pub z_col_vecs: Vec<Vec<F>>, // z_col_vecs[col][row], m' columns of length m
     pub z_r: Vec<EF>,            // proof vector z_r = X̃·G'^T·ḡ_r (length m)
     pub z_r_prime: Vec<EF>,      // proof vector z'_{r'} = X̃^T·G^T·ḡ'_{r'} (length m')
@@ -199,6 +198,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let row_fft = t0.elapsed();
 
     // Step 2: Column encode Z = G·W' (m' NTTs of size m, base field)
+    // Store results both column-major (for col commit) and row-major (for row commit).
     let t0 = std::time::Instant::now();
     let z_col_vecs: Vec<Vec<F>> = (0..m_prime)
         .into_par_iter()
@@ -207,22 +207,20 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
             plan_col.fwd_poly(&column)
         })
         .collect();
+    // Scatter into row-major during column hashing (fused with commit)
     let col_fft = t0.elapsed();
 
-    // Build row-major Z for row commitments
-    let z_row_major: Vec<F> = (0..m * m_prime)
-        .into_par_iter()
-        .map(|idx| z_col_vecs[idx % m_prime][idx / m_prime])
-        .collect();
-
-    // Step 3: Commit Z by rows AND by columns
+    // Step 3: Commit Z — columns contiguous, rows gathered on-the-fly (no z_row_major!)
     let t0 = std::time::Instant::now();
-    let row_leaves: Vec<Hash> = (0..m)
-        .into_par_iter()
-        .map(|i| hash_f_slice(&z_row_major[i * m_prime..(i + 1) * m_prime]))
-        .collect();
     let col_leaves: Vec<Hash> = z_col_vecs.par_iter()
         .map(|col| hash_f_slice(col))
+        .collect();
+    let row_leaves: Vec<Hash> = (0..m)
+        .into_par_iter()
+        .map(|row| {
+            let row_data: Vec<F> = (0..m_prime).map(|col| z_col_vecs[col][row]).collect();
+            hash_f_slice(&row_data)
+        })
         .collect();
     let tree_rows = MerkleTree::from_leaves(row_leaves);
     let tree_cols = MerkleTree::from_leaves(col_leaves);
@@ -281,7 +279,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
 
     ZodaEncoding {
         tree_rows, tree_cols,
-        z_row_major, z_col_vecs,
+        z_col_vecs,
         z_r, z_r_prime, g_bar, g_bar_prime,
         n, n_prime, m, m_prime,
         timing: EncodeTiming { row_fft, col_fft, commit, proof_vecs, total },
@@ -317,11 +315,8 @@ pub struct ColOpening { pub index: usize, pub data: Vec<F>, pub proof: MerklePro
 
 impl ZodaEncoding {
     pub fn open_row(&self, i: usize) -> RowOpening {
-        RowOpening {
-            index: i,
-            data: self.z_row_major[i * self.m_prime..(i+1) * self.m_prime].to_vec(),
-            proof: self.tree_rows.open(i),
-        }
+        let data: Vec<F> = (0..self.m_prime).map(|col| self.z_col_vecs[col][i]).collect();
+        RowOpening { index: i, data, proof: self.tree_rows.open(i) }
     }
     pub fn open_col(&self, j: usize) -> ColOpening {
         ColOpening {

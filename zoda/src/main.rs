@@ -66,7 +66,7 @@ fn main() {
     // Decode
     if do_decode {
         let z_rows: Vec<Vec<F>> = (0..m)
-            .map(|i| encoding.z_row_major[i * m_prime..(i+1) * m_prime].to_vec())
+            .map(|row| (0..m_prime).map(|col| encoding.z_col_vecs[col][row]).collect())
             .collect();
         let t0 = Instant::now();
         let decoded = decode_from_rows(&z_rows, m, m_prime, n, n_prime);
