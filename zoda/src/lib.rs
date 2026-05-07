@@ -249,7 +249,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     // z_r[row] = sum_j NTT_row(X̃[row])[j] * ḡ_r[j].
     // We can compute this without storing W': for each row, NTT X̃[row] then dot with ḡ_r.
     // But that's n extra NTTs. Instead: use Z and X.
-    // z_r = W' · ḡ_r ∈ EF^n (reuse W' = X̃·G'^T from step 1)
+    // z_r = W' · ḡ_r ∈ EF^n (W' already computed in step 1)
     let z_r: Vec<EF> = (0..n)
         .into_par_iter()
         .map(|row| {
@@ -259,7 +259,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
         })
         .collect();
 
-    // z'_{r'} = X^T · ḡ'_{r'} where X = G·X̃. Compute X columns (n' NTTs, reusing data).
+    // z'_{r'} = X^T · ḡ'_{r'} where X = G·X̃.
     let x_col_vecs: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
         .map(|col| {
