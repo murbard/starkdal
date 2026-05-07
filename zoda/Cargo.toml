@@ -11,6 +11,7 @@ path = "src/main.rs"
 # leanVM backend for KoalaBear field types only
 backend = { path = "../leanvm/crates/backend" }
 blake3 = "1"
+concrete-ntt = "0.2.0"
 rayon = "1.11"
 serde_json = "1.0"
 
