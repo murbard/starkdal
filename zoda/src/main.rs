@@ -68,13 +68,13 @@ fn main() {
     let open_time = t0.elapsed();
 
     let x_open_bytes: usize = x_openings.iter()
-        .map(|o| o.data.len() * 4 + o.proof.path.len() * DIGEST * 4)
+        .map(|o| o.data.len() * 4 + o.proof.byte_size())
         .sum();
     let y_open_bytes: usize = y_openings.iter()
-        .map(|o| o.data.len() * DIM * 4 + o.proof.path.len() * DIGEST * 4)
+        .map(|o| o.data.len() * DIM * 4 + o.proof.byte_size())
         .sum();
     let z_open_bytes: usize = z_openings.iter()
-        .map(|o| o.row_data.len() * DIM * 4 + o.proof.path.len() * DIGEST * 4)
+        .map(|o| o.row_data.len() * DIM * 4 + o.proof.byte_size())
         .sum();
     let total_open_bytes = x_open_bytes + y_open_bytes + z_open_bytes;
 
