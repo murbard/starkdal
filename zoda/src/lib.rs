@@ -96,31 +96,6 @@ pub fn coset_fft_f(coeffs: &[F], log_n: usize, twiddles: &[F]) -> Vec<F> {
     data
 }
 
-/// Batch coset FFT: process `num_polys` polynomials stored in a flat buffer.
-/// Input: `buf[poly * fft_size .. (poly+1) * fft_size]` = padded coefficients (coset-scaled)
-/// Output: same buffer, each polynomial replaced with its evaluations.
-/// Caller must pre-scale by g^i and zero-pad before calling.
-pub fn batch_ntt_f(buf: &mut [F], fft_size: usize, num_polys: usize, twiddles: &[F]) {
-    let log_n = fft_size.trailing_zeros() as usize;
-    buf.par_chunks_mut(fft_size)
-        .take(num_polys)
-        .for_each(|chunk| {
-            bit_reverse_permute(chunk, log_n);
-            ntt_in_place(chunk, log_n, twiddles);
-        });
-}
-
-/// Batch coset FFT over extension field.
-pub fn batch_ntt_ef(buf: &mut [EF], fft_size: usize, num_polys: usize, twiddles: &[F]) {
-    let log_n = fft_size.trailing_zeros() as usize;
-    buf.par_chunks_mut(fft_size)
-        .take(num_polys)
-        .for_each(|chunk| {
-            bit_reverse_permute_ef(chunk, log_n);
-            ntt_in_place_ef(chunk, log_n, twiddles);
-        });
-}
-
 pub fn coset_fft_ef(coeffs: &[EF], log_n: usize, twiddles: &[F]) -> Vec<EF> {
     let n = 1 << log_n;
     let g = F::from_u32(3);
@@ -398,34 +373,20 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let twiddles_mp = precompute_twiddles(log_m_prime);
     let t_total = std::time::Instant::now();
 
-    // Step 1: Column encode X = G · X̃  (batched base-field NTT, one alloc)
-    // Flat buffer: n_prime polynomials of size m, column-major → coset-scaled → NTT
+    // Step 1: Column encode X = G · X̃  (base field FFTs + parallel transpose)
     let t0 = std::time::Instant::now();
-    let g = F::from_u32(3);
-    let g_pows: Vec<F> = {
-        let mut v = vec![F::ONE; m]; let mut gp = F::ONE;
-        for x in &mut v { *x = gp; gp *= g; }
-        v
-    };
-    // Pack columns into flat buffer: buf[col * m + row] = data[row * n' + col] * g^row
-    let mut col_buf = vec![F::ZERO; n_prime * m];
-    col_buf.par_chunks_mut(m).enumerate().for_each(|(col, chunk)| {
-        for row in 0..n {
-            chunk[row] = data[row * n_prime + col] * g_pows[row];
-        }
-        // rows n..m stay zero (rate 1/2 padding)
-    });
-    batch_ntt_f(&mut col_buf, m, n_prime, &twiddles_m);
-    // col_buf[col * m + eval] = X[eval][col]. Transpose to row-major x_flat.
-    let x_flat: Vec<F> = (0..m * n_prime)
+    let x_col_vecs: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
-        .map(|idx| {
-            let row = idx / n_prime;
-            let col = idx % n_prime;
-            col_buf[col * m + row]
+        .map(|col| {
+            let coeffs: Vec<F> = (0..n).map(|row| data[row * n_prime + col]).collect();
+            coset_fft_f(&coeffs, log_m, &twiddles_m)
         })
         .collect();
-    drop(col_buf);
+    let x_flat: Vec<F> = (0..m * n_prime)
+        .into_par_iter()
+        .map(|idx| x_col_vecs[idx % n_prime][idx / n_prime])
+        .collect();
+    drop(x_col_vecs);
     let col_fft = t0.elapsed();
 
     // Step 2: Commit to rows of X  (BLAKE3 Merkle, bulk hash)
@@ -438,28 +399,28 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let root_x = tree_x.root();
     let commit_x = t0.elapsed();
 
-    // Step 3+4: Diagonal scale + row encode (batched EF NTT, one alloc)
-    // Buffer: n polynomials of size m_prime (EF), coset-scaled and diagonal-scaled
+    // Step 3: Diagonal scale X̃·D  (F * EF → EF, per element)
     let t0 = std::time::Instant::now();
     let diag = derive_diagonal(&root_x, n_prime);
-    let mut row_buf = vec![EF::ZERO; n * m_prime];
-    row_buf.par_chunks_mut(m_prime).enumerate().for_each(|(poly_idx, chunk)| {
-        let rd = &data[poly_idx * n_prime..(poly_idx + 1) * n_prime];
-        let mut g_pow = F::ONE;
-        for coeff in 0..n_prime {
-            chunk[coeff] = EF::from(rd[coeff] * g_pow) * diag[coeff];
-            g_pow *= g;
-        }
-    });
+    let x_tilde_d: Vec<Vec<EF>> = (0..n)
+        .into_par_iter()
+        .map(|row| {
+            let row_data = &data[row * n_prime..(row + 1) * n_prime];
+            row_data
+                .iter()
+                .enumerate()
+                .map(|(col, &x)| EF::from(x) * diag[col])
+                .collect()
+        })
+        .collect();
     let diag_scale = t0.elapsed();
 
+    // Step 4: Row encode Y = (X̃·D) · G'^T  (EF-FFTs, twiddles are base-field)
     let t0 = std::time::Instant::now();
-    batch_ntt_ef(&mut row_buf, m_prime, n, &twiddles_mp);
-    // row_buf[poly * m_prime + eval] = Y[poly][eval]
     let y_rows: Vec<Vec<EF>> = (0..n)
-        .map(|poly| row_buf[poly * m_prime..(poly + 1) * m_prime].to_vec())
+        .into_par_iter()
+        .map(|row| coset_fft_ef(&x_tilde_d[row], log_m_prime, &twiddles_mp))
         .collect();
-    drop(row_buf);
     let row_fft = t0.elapsed();
 
     // Step 5: Commit to columns of Y  (BLAKE3 Merkle, EF data)
