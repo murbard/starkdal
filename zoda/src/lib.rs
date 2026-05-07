@@ -241,8 +241,9 @@ pub struct ZodaEncoding {
     pub root_y: Hash,
     pub tree_x: MerkleTree,
     pub tree_y: MerkleTree,
-    pub x_flat: Vec<F>,       // m × n', row-major (bit-reversed eval order)
-    pub y: Vec<Vec<EF>>,      // n rows × m' cols (bit-reversed eval order)
+    pub x_cols: Vec<Vec<F>>, // column-major: x_cols[col][eval]
+    pub x_flat: Vec<F>,      // row-major: x_flat[eval * n' + col] (for row openings)
+    pub y: Vec<Vec<EF>>,     // y[row][eval]
     pub diag: Vec<EF>,
     pub n: usize,
     pub n_prime: usize,
@@ -263,7 +264,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let plan_col = NttPlan::new(m.trailing_zeros() as usize);
     let plan_row = NttPlan::new(m_prime.trailing_zeros() as usize);
 
-    // Step 1: Column encode X = G · X̃ (per-FFT allocation, parallel)
+    // Step 1: Column encode X = G · X̃
     let t0 = std::time::Instant::now();
     let x_col_vecs: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
@@ -272,14 +273,15 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
             plan_col.fwd_poly(&coeffs)
         })
         .collect();
+    let col_fft = t0.elapsed();
+
+    // Lazy transpose (deferred, only when needed for row openings)
     let x_flat: Vec<F> = (0..m * n_prime)
         .into_par_iter()
         .map(|idx| x_col_vecs[idx % n_prime][idx / n_prime])
         .collect();
-    drop(x_col_vecs);
-    let col_fft = t0.elapsed();
 
-    // Step 2: Commit to rows of X
+    // Step 2: Commit to rows of X (needed for row-based sampling protocol)
     let t0 = std::time::Instant::now();
     let x_leaves: Vec<Hash> = (0..m)
         .into_par_iter()
@@ -303,7 +305,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
         .collect();
     let diag_scale = t0.elapsed();
 
-    // Step 4: Row encode Y = (X̃·D) · G'^T (EF via per-FFT 5-way decompose)
+    // Step 4: Row encode Y = (X̃·D) · G'^T (EF via 5 decomposed NTTs)
     let t0 = std::time::Instant::now();
     let y_rows: Vec<Vec<EF>> = (0..n)
         .into_par_iter()
@@ -324,7 +326,7 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let total = t_total.elapsed();
     ZodaEncoding {
         root_x, root_y, tree_x, tree_y,
-        x_flat, y: y_rows, diag,
+        x_cols: x_col_vecs, x_flat, y: y_rows, diag,
         n, n_prime, m, m_prime,
         timing: EncodeTiming { col_fft, commit_x, diag_scale, row_fft, commit_y, total },
     }
@@ -465,13 +467,13 @@ pub fn verify(
 //  Decoding
 // ═══════════════════════════════════════════════════════════════════════════
 
-pub fn decode_from_x_flat(x_flat: &[F], m: usize, n: usize, n_prime: usize) -> Vec<F> {
+pub fn decode_from_x_cols(x_cols: &[Vec<F>], n: usize, n_prime: usize) -> Vec<F> {
+    let m = x_cols[0].len();
     let plan = NttPlan::new(m.trailing_zeros() as usize);
     let decoded_cols: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
         .map(|col| {
-            let evals: Vec<F> = (0..m).map(|row| x_flat[row * n_prime + col]).collect();
-            let coeffs = plan.inv_evals(&evals);
+            let coeffs = plan.inv_evals(&x_cols[col]);
             coeffs[..n].to_vec()
         })
         .collect();

@@ -83,7 +83,7 @@ fn main() {
     // Decode
     if do_decode {
         let t0 = Instant::now();
-        let decoded = decode_from_x_flat(&encoding.x_flat, m, n, n_prime);
+        let decoded = decode_from_x_cols(&encoding.x_cols, n, n_prime);
         let dt = t0.elapsed();
         assert_eq!(decoded, data, "X-decode mismatch");
         eprintln!("  decode (X rows): {:.3}s CORRECT", dt.as_secs_f64());
