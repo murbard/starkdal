@@ -1,0 +1,18 @@
+[package]
+name = "zoda-bench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "zoda-bench"
+path = "src/main.rs"
+
+[dependencies]
+# We pull in the same backend as leanVM for field types and Poseidon
+backend = { path = "../leanvm/crates/backend" }
+utils = { path = "../leanvm/crates/utils" }
+rayon = "1.11"
+serde_json = "1.0"
+
+[profile.release]
+lto = "thin"
