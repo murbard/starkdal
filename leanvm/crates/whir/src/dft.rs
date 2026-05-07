@@ -39,12 +39,12 @@ use crate::{Matrix, RowMajorMatrix, RowMajorMatrixViewMut};
 const LAYERS_PER_GROUP: usize = 3;
 
 #[derive(Default, Debug)]
-pub(crate) struct EvalsDft<F> {
+pub struct EvalsDft<F> {
     twiddles: RwLock<Vec<Vec<F>>>,
 }
 
 impl<F: TwoAdicField> EvalsDft<F> {
-    pub(crate) fn max_n_twiddles(&self) -> usize {
+    pub fn max_n_twiddles(&self) -> usize {
         let guard = self.twiddles.read().unwrap();
         1 << guard.len()
     }
@@ -61,7 +61,7 @@ impl<F: TwoAdicField> EvalsDft<F> {
             .collect()
     }
 
-    pub(crate) fn update_twiddles(&self, fft_len: usize) {
+    pub fn update_twiddles(&self, fft_len: usize) {
         // TODO: This recomputes the entire table from scratch if we
         // need it to be larger, which is wasteful.
         let mut guard = self.twiddles.write().unwrap();
@@ -76,7 +76,7 @@ impl<F> EvalsDft<F>
 where
     F: TwoAdicField,
 {
-    pub(crate) fn dft_batch_by_evals(&self, mut mat: RowMajorMatrix<F>) -> RowMajorMatrix<F> {
+    pub fn dft_batch_by_evals(&self, mut mat: RowMajorMatrix<F>) -> RowMajorMatrix<F> {
         let h = mat.height();
         let w = mat.width();
         let log_h = log2_strict_usize(h);
@@ -144,7 +144,7 @@ where
     }
 
     #[instrument(skip_all)]
-    pub(crate) fn dft_algebra_batch_by_evals<V: BasedVectorSpace<F> + Clone + Send + Sync>(
+    pub fn dft_algebra_batch_by_evals<V: BasedVectorSpace<F> + Clone + Send + Sync>(
         &self,
         mat: RowMajorMatrix<V>,
     ) -> RowMajorMatrix<V> {
