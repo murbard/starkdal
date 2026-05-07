@@ -190,18 +190,15 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let plan_col = NttPlan::new(m.trailing_zeros() as usize);
     let t_total = std::time::Instant::now();
 
-    // Step 1: Row encode W' = X̃·G'^T (n NTTs of size m', all base field)
+    // Step 1: Row encode W' = X̃·G'^T (n NTTs of size m', base field)
     let t0 = std::time::Instant::now();
     let w_prime_rows: Vec<Vec<F>> = (0..n)
         .into_par_iter()
-        .map(|row| {
-            plan_row.fwd_poly(&data[row * n_prime..(row + 1) * n_prime])
-        })
+        .map(|row| plan_row.fwd_poly(&data[row * n_prime..(row + 1) * n_prime]))
         .collect();
     let row_fft = t0.elapsed();
 
-    // Step 2: Column encode Z = G·W' (m' NTTs of size m, all base field)
-    // Z[eval][col] = column NTT of W'[:,col] at eval
+    // Step 2: Column encode Z = G·W' (m' NTTs of size m, base field)
     let t0 = std::time::Instant::now();
     let z_col_vecs: Vec<Vec<F>> = (0..m_prime)
         .into_par_iter()
@@ -236,54 +233,23 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let root_rows = tree_rows.root();
     let root_cols = tree_cols.root();
 
-    // ḡ_r ∈ EF^{n'} — derived from row commitment
-    let g_bar: Vec<EF> = derive_ef_vector(&root_rows, n_prime, b"ZODA_G_BAR");
-    // ḡ'_{r'} ∈ EF^{n} — derived from column commitment
-    let g_bar_prime: Vec<EF> = derive_ef_vector(&root_cols, n, b"ZODA_G_BAR_PRIME");
-
-    // z_r = X̃·G'^T·ḡ_r: first compute v = G'^T·ḡ_r (NTT of ḡ_r, length m'), then z_r = X̃·v
-    // Actually: z_r[row] = sum_col (X̃·G'^T)[row][col] * ḡ_r[col]
-    //                     = sum_col W'[row][col] * ḡ_r... wait, ḡ_r has length n', but W' has m' columns.
-    // Let me re-read: z_r = X̃·G'^T·ḡ_r where ḡ_r ∈ F^{n'} (not m').
-    // X̃·G'^T is n × m'. ḡ_r is n'-vector. That doesn't work dimensionally.
-    //
-    // Re-reading the paper: "Compute and send z_r = X̃G'^T ḡ_r"
-    // X̃ is n × n', G'^T is n' × m', ḡ_r is... the paper says ḡ_r ∈ F^n.
-    // Wait: "Receive some uniformly random ḡ_r ∈ F^n and ḡ'_{r'} ∈ F^{n'}"
-    //
-    // So ḡ_r ∈ F^n, ḡ'_{r'} ∈ F^{n'}.
-    // z_r = X̃·G'^T·ḡ_r... but X̃·G'^T is n×m' and ḡ_r is n-vector. Doesn't match.
-    //
-    // Actually looking more carefully: "Compute and send zr = X̃G'T ḡr"
-    // Hmm, maybe ḡ_r acts on the rows? z_r = (X̃·G'^T)^T · ḡ_r = G'·X̃^T · ḡ_r?
-    // That gives z_r ∈ F^{m'}.
-    //
-    // Or maybe the sampling check clarifies: "Check W_S ḡ_r = G_S z_r"
-    // W_S is |S| × m' (rows of Z). ḡ_r is... W_S · ḡ_r requires ḡ_r ∈ F^{m'}.
-    // But the paper says ḡ_r ∈ F^n. Contradiction?
-    //
-    // Wait, re-reading: "Receive some uniformly random ḡ_r ∈ F^n"
-    // And check: "W_S ḡ_r = G_S z_r"
-    // W is m × m' (rows of Z). W_S is |S| × m'. For W_S · ḡ_r to work, ḡ_r ∈ F^{m'}.
-    // But paper says F^n. Must be a typo. Let me use the check dimensions.
-    //
-    // From the check: W_S · ḡ_r makes ḡ_r ∈ F^{m'} and result ∈ F^{|S|}.
-    // G_S · z_r: G_S is |S| × n, z_r ∈ F^n, result ∈ F^{|S|}. ✓
-    //
-    // So ḡ_r ∈ F^{m'} (or EF^{m'}), z_r ∈ F^n (or EF^n).
-    // z_r = ... from "X̃G'^T ḡ_r": X̃ is n×n', G'^T is n'×m', ḡ_r is m'-vector.
-    // X̃·G'^T is n×m'. (X̃·G'^T) · ḡ_r is n-vector. z_r ∈ F^n. ✓
-    //
-    // Similarly ḡ'_{r'} ∈ F^m (or EF^m), z'_{r'} ∈ F^{n'}.
-    // z'_{r'} = X̃^T · G^T · ḡ'_{r'}: X̃^T is n'×n, G^T is n×m, ḡ'_{r'} is m-vector.
-    // (X̃^T · G^T) · ḡ'_{r'} is n'-vector. ✓
-
-    // ḡ_r ∈ EF^{m'}, ḡ'_{r'} ∈ EF^{m}
+    // Dimensions (from verification checks):
+    // ḡ_r ∈ EF^{m'}, z_r ∈ EF^n: z_r = (X̃·G'^T) · ḡ_r
+    // ḡ'_{r'} ∈ EF^m, z'_{r'} ∈ EF^{n'}: z'_{r'} = (G·X̃)^T · ḡ'_{r'}
     let g_bar: Vec<EF> = derive_ef_vector(&root_rows, m_prime, b"ZODA_G_BAR");
     let g_bar_prime: Vec<EF> = derive_ef_vector(&root_cols, m, b"ZODA_G_BAR_PRIME");
 
-    // z_r = (X̃·G'^T) · ḡ_r = W' · ḡ_r ∈ EF^n
-    // z_r[row] = sum_j W'[row][j] * ḡ_r[j]
+    // z_r[row] = sum_j Z[row][j] * ḡ_r[j]  (Z row = X·G'^T row, already computed)
+    // Actually z_r = (X̃·G'^T)·ḡ_r, but Z = G·(X̃·G'^T), so Z[eval] = G-encoded row.
+    // We need W' = X̃·G'^T, not Z. But we computed Z = X·G'^T where X = G·X̃.
+    // Z[eval][j] = row NTT of X[eval] at j. X[eval] is already column-encoded.
+    // So Z[eval] ≠ W'[row]. We need W'[row] = row NTT of X̃[row].
+    // W'[row][j] = z_rows_vecs... no, z_rows_vecs[eval][j] = Z[eval][j] = NTT_row(X[eval]).
+    // We don't have W' directly. But z_r = W' · ḡ_r where W'[row] = NTT_row(X̃[row]).
+    // z_r[row] = sum_j NTT_row(X̃[row])[j] * ḡ_r[j].
+    // We can compute this without storing W': for each row, NTT X̃[row] then dot with ḡ_r.
+    // But that's n extra NTTs. Instead: use Z and X.
+    // z_r = W' · ḡ_r ∈ EF^n (reuse W' = X̃·G'^T from step 1)
     let z_r: Vec<EF> = (0..n)
         .into_par_iter()
         .map(|row| {
@@ -293,39 +259,19 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
         })
         .collect();
 
-    // z'_{r'} = (X̃^T · G^T) · ḡ'_{r'} ∈ EF^{n'}
-    // First compute G·X̃ column-wise (we have z_col_vecs which is G·W', not G·X̃).
-    // Actually: X̃^T · G^T = (G·X̃)^T. And G·X̃ = X (the column encoding).
-    // X is m × n'. X^T is n' × m. z'_{r'} = X^T · ḡ'_{r'} ∈ EF^{n'}.
-    // X[eval][col] = z_col_vecs[col][eval] (column-major from step 2... wait, z_col_vecs
-    // is the FULL tensor Z, not just X=G·X̃. Let me recompute.)
-    //
-    // Actually X = G·X̃ is the column encoding. We computed W' = X̃·G'^T first, then Z = G·W'.
-    // X = G·X̃ is a separate computation (just the column encoding without row encoding).
-    // We need X for z'_{r'}.
-    //
-    // X[:,col] = NTT of X̃[:,col]. We didn't compute this separately. But we can compute
-    // z'_{r'} from Z directly:
-    // Z = G·X̃·G'^T. Z^T = G'·X̃^T·G^T.
-    // z'_{r'} = X̃^T · G^T · ḡ'_{r'}.
-    // Note: Z = G · (X̃ · G'^T), so Z[:,j] = G · (X̃·G'^T)[:,j] = G · W'[:,j].
-    // We need X̃^T · G^T, which is (G·X̃)^T.
-    // G·X̃[:,col] = plan_col.fwd_poly(X̃[:,col]).
-    // Let me just compute this.
-    let x_col_ntt: Vec<Vec<F>> = (0..n_prime)
+    // z'_{r'} = X^T · ḡ'_{r'} where X = G·X̃. Compute X columns (n' NTTs, reusing data).
+    let x_col_vecs: Vec<Vec<F>> = (0..n_prime)
         .into_par_iter()
         .map(|col| {
             let coeffs: Vec<F> = (0..n).map(|row| data[row * n_prime + col]).collect();
             plan_col.fwd_poly(&coeffs)
         })
         .collect();
-    // x_col_ntt[col][eval] = X[eval][col] = (G·X̃)[eval][col]
-    // z'_{r'}[col] = sum_eval X[eval][col] * ḡ'_{r'}[eval] = sum_eval x_col_ntt[col][eval] * ḡ'_{r'}[eval]
     let z_r_prime: Vec<EF> = (0..n_prime)
         .into_par_iter()
         .map(|col| {
             let mut acc = EF::ZERO;
-            for eval in 0..m { acc += EF::from(x_col_ntt[col][eval]) * g_bar_prime[eval]; }
+            for eval in 0..m { acc += EF::from(x_col_vecs[col][eval]) * g_bar_prime[eval]; }
             acc
         })
         .collect();
