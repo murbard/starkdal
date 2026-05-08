@@ -1,5 +1,6 @@
-//! FFT in circuit, fully unrolled butterflies.
-//! Fast cycles, but program size explodes at large n.
+//! Approach 1b: FFT + Merkle in circuit, fully unrolled butterflies.
+//! Fast cycles, but program size explodes at large n (42M lines at n=18).
+//! Superseded by bench_syndrome_unroll (syndrome check avoids FFT entirely).
 use starkdal_leanvm::*;
 use std::collections::HashMap;
 

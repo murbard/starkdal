@@ -25,7 +25,6 @@ pub use utils::precompute_dft_twiddles;
 pub(crate) use utils::*;
 
 mod matrix;
-pub use matrix::{DenseMatrix, RowMajorMatrix};
 pub(crate) use matrix::*;
 
 #[derive(Clone, Debug)]

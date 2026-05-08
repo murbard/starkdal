@@ -1,5 +1,6 @@
-//! FFT in circuit, range() loops for butterflies.
-//! Compact program, but range() loop overhead.
+//! Approach 1a: FFT + Merkle in circuit, range() loops for butterflies.
+//! Compact program, but range() loop overhead (~10x slower than unroll).
+//! Superseded by bench_syndrome_unroll (syndrome check avoids FFT entirely).
 use starkdal_leanvm::*;
 use std::collections::HashMap;
 

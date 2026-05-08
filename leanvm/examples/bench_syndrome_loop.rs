@@ -1,5 +1,6 @@
-//! Syndrome check, range() loops for accumulation.
-//! Compact program for any n, but range() loop overhead.
+//! Approach 2a: Syndrome check, range() loops for accumulation.
+//! Compact program for any n, but range() loop overhead (~10x slower than unroll).
+//! Superseded by bench_syndrome_unroll.
 use starkdal_leanvm::*;
 use std::collections::HashMap;
 

@@ -1,9 +1,10 @@
-//! Chunked parallel proving with shared bytecode.
+//! Approach 2c: Chunked parallel syndrome proving with shared bytecode.
 //!
-//! ALL chunks share one compiled bytecode. Per-chunk coset starting values are passed
-//! via public input. Chunks are proven in parallel using rayon.
+//! Splits one large codeword into chunks, proves each chunk independently
+//! (shared bytecode, per-chunk coset offsets via public input), then
+//! verifies partial syndrome sums add to zero.
 //!
-//! Usage: cargo run --release --example bench_chunked -- --log-n 22 --log-chunk 12
+//! Usage: cargo run --release --example bench_chunked -- --log-n 22 --log-chunk 12 --concurrency 8
 
 use rayon::prelude::*;
 use starkdal_leanvm::*;

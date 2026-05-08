@@ -1,15 +1,17 @@
-//! RLC + fold benchmark: batch m codewords via random linear combination,
-//! then fold with random challenges.
+//! Approach 3: RLC + fold — fastest STARK-based approach (1.4 MB/s on Graviton4).
 //!
-//! Exercises extension-field precompiles:
-//!   - `dot_product_be` for RLC  (m base×ext muls per position, m trace rows)
-//!   - `dot_product_ee` + `add_ee` for fold (2 trace rows per butterfly)
+//! Batches m codewords via Random Linear Combination using extension-field
+//! precompiles (dot_product_be), then folds with random challenges
+//! (dot_product_ee + add_ee). Inspired by the leanDAS/STARS paper.
+//!
+//! Key insight: m codewords per proof amortizes WHIR overhead. At m=510,
+//! saturates the 2^21 extension-op table → ~4 MB per proof.
 //!
 //! Single proof:
 //!   cargo run --release --example bench_fri_fold -- --log-poly 11 --m 510
 //!
-//! Parallel batches:
-//!   cargo run --release --example bench_fri_fold -- --log-poly 11 --m 510 --batches 4 --concurrency 2
+//! Parallel batches (16 MB total, 4 proofs):
+//!   cargo run --release --example bench_fri_fold -- --log-poly 11 --m 510 --batches 4 --concurrency 4
 
 use rayon::prelude::*;
 use starkdal_leanvm::*;

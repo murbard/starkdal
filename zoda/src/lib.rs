@@ -231,23 +231,11 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let root_rows = tree_rows.root();
     let root_cols = tree_cols.root();
 
-    // Dimensions (from verification checks):
-    // ḡ_r ∈ EF^{m'}, z_r ∈ EF^n: z_r = (X̃·G'^T) · ḡ_r
-    // ḡ'_{r'} ∈ EF^m, z'_{r'} ∈ EF^{n'}: z'_{r'} = (G·X̃)^T · ḡ'_{r'}
+    // ḡ_r ∈ EF^{m'}, ḡ'_{r'} ∈ EF^m (from Fiat-Shamir on commitments)
     let g_bar: Vec<EF> = derive_ef_vector(&root_rows, m_prime, b"ZODA_G_BAR");
     let g_bar_prime: Vec<EF> = derive_ef_vector(&root_cols, m, b"ZODA_G_BAR_PRIME");
 
-    // z_r[row] = sum_j Z[row][j] * ḡ_r[j]  (Z row = X·G'^T row, already computed)
-    // Actually z_r = (X̃·G'^T)·ḡ_r, but Z = G·(X̃·G'^T), so Z[eval] = G-encoded row.
-    // We need W' = X̃·G'^T, not Z. But we computed Z = X·G'^T where X = G·X̃.
-    // Z[eval][j] = row NTT of X[eval] at j. X[eval] is already column-encoded.
-    // So Z[eval] ≠ W'[row]. We need W'[row] = row NTT of X̃[row].
-    // W'[row][j] = z_rows_vecs... no, z_rows_vecs[eval][j] = Z[eval][j] = NTT_row(X[eval]).
-    // We don't have W' directly. But z_r = W' · ḡ_r where W'[row] = NTT_row(X̃[row]).
-    // z_r[row] = sum_j NTT_row(X̃[row])[j] * ḡ_r[j].
-    // We can compute this without storing W': for each row, NTT X̃[row] then dot with ḡ_r.
-    // But that's n extra NTTs. Instead: use Z and X.
-    // z_r = W' · ḡ_r ∈ EF^n (W' already computed in step 1)
+    // z_r = W' · ḡ_r ∈ EF^n where W' = X̃·G'^T (row-encoded data from step 1)
     let z_r: Vec<EF> = (0..n)
         .into_par_iter()
         .map(|row| {

@@ -1,5 +1,9 @@
-//! Syndrome check, fully unrolled accumulation.
-//! Fast cycles, compact-ish program (O(n_eval) lines, not O(n_eval × log)).
+//! Approach 2b: Syndrome check with fully unrolled accumulation.
+//! Verifies RS membership via batched syndrome check (Schwartz-Zippel).
+//! O(n_eval) program lines, 4 random challenges for 80-bit security.
+//! Uses barycentric-style 1/(β - x_j) weights.
+//!
+//! Usage: cargo run --release --example bench_syndrome_unroll -- --log-n 12
 use starkdal_leanvm::*;
 use std::collections::HashMap;
 

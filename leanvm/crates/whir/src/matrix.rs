@@ -110,8 +110,8 @@ pub trait Matrix<T: Send + Sync + Clone>: Send + Sync {
     }
 }
 
-pub type RowMajorMatrix<T> = DenseMatrix<T>;
-pub type RowMajorMatrixViewMut<'a, T> = DenseMatrix<T, &'a mut [T]>;
+pub(crate) type RowMajorMatrix<T> = DenseMatrix<T>;
+pub(crate) type RowMajorMatrixViewMut<'a, T> = DenseMatrix<T, &'a mut [T]>;
 
 impl<T: Clone + Send + Sync, S: DenseStorage<T>> DenseMatrix<T, S> {
     pub fn as_view_mut(&mut self) -> RowMajorMatrixViewMut<'_, T>

@@ -1,4 +1,12 @@
-//! ZODA Tensor Variation benchmark.
+//! ZODA Tensor Variation (Appendix E) — full encode → open → verify → decode pipeline.
+//!
+//! Z = G·X̃·G'^T entirely over base field (4× expansion). Proof vectors
+//! z_r, z'_{r'} in extension field (negligible network cost).
+//!
+//! Usage:
+//!   cargo run --release -- --n 4096             # 64 MB encode
+//!   cargo run --release -- --n 4096 --decode    # + decode roundtrip
+//!   cargo run --release -- --n 8192 --samples 50
 use std::time::Instant;
 use zoda_bench::*;
 
