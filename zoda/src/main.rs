@@ -59,9 +59,10 @@ fn main() {
     let open_time = t0.elapsed();
     eprintln!("  open: {:.3}s", open_time.as_secs_f64());
 
-    // Verify
+    // Verify (using only the commitment, not the full encoding)
+    let commitment = ZodaCommitment::from(&encoding);
     let t0 = Instant::now();
-    let result = verify(&encoding, &row_opens, &col_opens);
+    let result = verify(&commitment, &row_opens, &col_opens);
     let verify_time = t0.elapsed();
     eprintln!("  verify: {:.3}s  {}  (rows {}/{}, cols {}/{}, cross {})",
         verify_time.as_secs_f64(),
