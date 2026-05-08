@@ -94,10 +94,9 @@ fn main() {
     eprintln!("------------------------------------------------------------");
     eprintln!("  Data       : {:.2} MB (4× → {:.2} MB encoded)",
         data_bytes as f64 / (1024.0*1024.0), z_bytes as f64 / (1024.0*1024.0));
-    eprintln!("  NTT only   : {:.3}s ({:.0} MB/s per core on {} data)",
+    eprintln!("  NTT only   : {:.3}s ({:.0} MB/s per core on user data)",
         (t.row_fft + t.col_fft).as_secs_f64(),
-        data_bytes as f64 / (1024.0*1024.0) / (t.row_fft + t.col_fft).as_secs_f64() / num_cpus() as f64,
-        "user");
+        data_bytes as f64 / (1024.0*1024.0) / (t.row_fft + t.col_fft).as_secs_f64() / num_cpus() as f64);
     eprintln!("  Peak RSS   : {:.2} GB", peak_rss as f64 / (1u64 << 30) as f64);
     eprintln!("------------------------------------------------------------");
 

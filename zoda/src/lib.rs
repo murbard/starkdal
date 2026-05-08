@@ -58,6 +58,7 @@ pub struct NttPlan {
     pub log_n: usize,
     pub n: usize,
     plan: concrete_ntt::prime32::Plan,
+    n_inv: F,
     pub psi: F,
     pub eval_pts: Vec<F>,
 }
@@ -69,8 +70,6 @@ impl NttPlan {
             .unwrap_or_else(|| panic!("concrete-ntt: size {n} unsupported for p={P:#x}"));
 
         // Extract ψ from NTT of [0, monty(1), 0, ..., 0].
-        // output[0] = monty(1) · ψ^{2·bitrev(0)+1} = monty(1) · ψ.
-        // Interpreting as MontyField31 gives canonical value ψ.
         let one_raw: u32 = unsafe { *(&F::from_u32(1) as *const F as *const u32) };
         let mut probe = vec![0u32; n];
         probe[1] = one_raw;
@@ -81,7 +80,9 @@ impl NttPlan {
             .map(|k| psi.exp_u64((2 * bit_reverse(k, log_n) + 1) as u64))
             .collect();
 
-        Self { log_n, n, plan, psi, eval_pts }
+        let n_inv = F::from_u32(n as u32).inverse();
+
+        Self { log_n, n, plan, n_inv, psi, eval_pts }
     }
 
     /// Forward negacyclic NTT in-place.
@@ -100,8 +101,7 @@ impl NttPlan {
             std::slice::from_raw_parts_mut(data.as_mut_ptr().cast::<u32>(), self.n)
         };
         self.plan.inv(data_u32);
-        let n_inv = F::from_u32(self.n as u32).inverse();
-        for v in data.iter_mut() { *v *= n_inv; }
+        for v in data.iter_mut() { *v *= self.n_inv; }
     }
 
     /// Forward NTT of a polynomial (zero-padded to size n).
@@ -110,6 +110,25 @@ impl NttPlan {
         data[..coeffs.len().min(self.n)].copy_from_slice(&coeffs[..coeffs.len().min(self.n)]);
         self.fwd(&mut data);
         data
+    }
+
+    /// Forward NTT of an EF polynomial: decompose into DIM base-field NTTs.
+    pub fn fwd_poly_ef(&self, coeffs: &[EF]) -> Vec<EF> {
+        let len = coeffs.len().min(self.n);
+        let comps: Vec<Vec<F>> = (0..DIM).map(|k| {
+            let mut buf = vec![F::ZERO; self.n];
+            for i in 0..len {
+                let c: &[F] = coeffs[i].as_basis_coefficients_slice();
+                buf[i] = c[k];
+            }
+            self.fwd(&mut buf);
+            buf
+        }).collect();
+        (0..self.n).map(|i| {
+            EF::from_basis_coefficients_slice(&[
+                comps[0][i], comps[1][i], comps[2][i], comps[3][i], comps[4][i],
+            ]).unwrap()
+        }).collect()
     }
 
     /// Inverse NTT recovering polynomial coefficients.
@@ -136,10 +155,15 @@ impl MerkleTree {
         let mut layers = vec![leaves];
         while layers.last().unwrap().len() > 1 {
             let prev = layers.last().unwrap();
-            let mut padded = prev.clone();
-            if padded.len() % 2 != 0 { padded.push(MERKLE_PAD); }
-            let next: Vec<Hash> = (0..padded.len() / 2)
-                .map(|i| hash_pair(&padded[2*i], &padded[2*i+1])).collect();
+            let n = prev.len();
+            let pairs = n / 2;
+            let mut next = Vec::with_capacity(pairs + (n & 1));
+            for i in 0..pairs {
+                next.push(hash_pair(&prev[2*i], &prev[2*i+1]));
+            }
+            if n % 2 != 0 {
+                next.push(hash_pair(&prev[n - 1], &MERKLE_PAD));
+            }
             layers.push(next);
         }
         Self { layers }
@@ -192,8 +216,6 @@ pub struct ZodaEncoding {
     pub z_col_vecs: Vec<Vec<F>>, // z_col_vecs[col][row], m' columns of length m
     pub z_r: Vec<EF>,            // proof vector (length n)
     pub z_r_prime: Vec<EF>,      // proof vector (length n')
-    pub g_bar: Vec<EF>,          // random vector ḡ_r (length m')
-    pub g_bar_prime: Vec<EF>,    // random vector ḡ'_{r'} (length m)
     pub n: usize,
     pub n_prime: usize,
     pub m: usize,
@@ -201,15 +223,15 @@ pub struct ZodaEncoding {
     pub timing: EncodeTiming,
 }
 
-/// What the verifier receives: commitments + proof vectors + parameters.
-/// Does NOT include the full encoding.
+/// What the verifier receives: Merkle roots + proof vectors + parameters.
+/// Random vectors ḡ_r and ḡ'_{r'} are NOT stored — the verifier re-derives
+/// them from the roots via Fiat-Shamir (prevents a malicious prover from
+/// substituting different random vectors).
 pub struct ZodaCommitment {
     pub root_rows: Hash,
     pub root_cols: Hash,
-    pub z_r: Vec<EF>,
-    pub z_r_prime: Vec<EF>,
-    pub g_bar: Vec<EF>,
-    pub g_bar_prime: Vec<EF>,
+    pub z_r: Vec<EF>,        // proof vector (length n)
+    pub z_r_prime: Vec<EF>,  // proof vector (length n')
     pub n: usize,
     pub n_prime: usize,
     pub m: usize,
@@ -223,11 +245,17 @@ impl From<&ZodaEncoding> for ZodaCommitment {
             root_cols: enc.tree_cols.root(),
             z_r: enc.z_r.clone(),
             z_r_prime: enc.z_r_prime.clone(),
-            g_bar: enc.g_bar.clone(),
-            g_bar_prime: enc.g_bar_prime.clone(),
             n: enc.n, n_prime: enc.n_prime, m: enc.m, m_prime: enc.m_prime,
         }
     }
+}
+
+/// Derive the Fiat-Shamir seed from both Merkle roots.
+fn fs_seed(root_rows: &Hash, root_cols: &Hash) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(root_rows);
+    hasher.update(root_cols);
+    *hasher.finalize().as_bytes()
 }
 
 /// Encode data matrix X̃ (n × n', row-major) using the tensor variation.
@@ -278,19 +306,11 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let tree_cols = MerkleTree::from_leaves(col_leaves);
     let commit = t0.elapsed();
 
-    // Step 4: Proof vectors via Fiat-Shamir
-    // Randomness derived from BOTH roots (prevents adaptive commitment attacks).
+    // Step 4: Proof vectors via Fiat-Shamir (randomness binds BOTH roots)
     let t0 = std::time::Instant::now();
-    let fs_seed = {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&tree_rows.root());
-        hasher.update(&tree_cols.root());
-        *hasher.finalize().as_bytes()
-    };
-
-    // ḡ_r ∈ EF^{m'}, ḡ'_{r'} ∈ EF^m
-    let g_bar: Vec<EF> = derive_ef_vector(&fs_seed, m_prime, b"ZODA_G_BAR");
-    let g_bar_prime: Vec<EF> = derive_ef_vector(&fs_seed, m, b"ZODA_G_BAR_PRIME");
+    let seed = fs_seed(&tree_rows.root(), &tree_cols.root());
+    let g_bar: Vec<EF> = derive_ef_vector(&seed, m_prime, b"ZODA_G_BAR");
+    let g_bar_prime: Vec<EF> = derive_ef_vector(&seed, m, b"ZODA_G_BAR_PRIME");
 
     // z_r = W' · ḡ_r ∈ EF^n where W' = X̃·G'^T (from step 1)
     let z_r: Vec<EF> = (0..n)
@@ -323,37 +343,34 @@ pub fn encode(data: &[F], n: usize, n_prime: usize) -> ZodaEncoding {
     let total = t_total.elapsed();
 
     ZodaEncoding {
-        tree_rows, tree_cols,
-        z_col_vecs,
-        z_r, z_r_prime, g_bar, g_bar_prime,
+        tree_rows, tree_cols, z_col_vecs,
+        z_r, z_r_prime,
         n, n_prime, m, m_prime,
         timing: EncodeTiming { row_fft, col_fft, commit, proof_vecs, total },
     }
 }
 
-/// Derive EF random vector via BLAKE3 sponge with rejection sampling.
+/// Derive EF random vector via BLAKE3 XOF with rejection sampling.
 fn derive_ef_vector(seed: &Hash, len: usize, domain: &[u8]) -> Vec<EF> {
+    let mut base_hasher = blake3::Hasher::new();
+    base_hasher.update(seed);
+    base_hasher.update(domain);
+    let mut reader = base_hasher.finalize_xof();
+
     let mut vec = Vec::with_capacity(len);
-    let mut state = *seed;
-    for i in 0..len {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(&state);
-        hasher.update(&(i as u64).to_le_bytes());
-        hasher.update(domain);
-        state = *hasher.finalize().as_bytes();
+    for _ in 0..len {
         let mut comps = [F::ZERO; DIM];
-        for (k, comp) in comps.iter_mut().enumerate() {
-            let off = k * 4;
-            let mut val = u32::from_le_bytes([state[off], state[off+1], state[off+2], state[off+3]]);
-            // Rejection sampling: redraw if val >= P to avoid modular bias
-            while val >= P as u32 {
-                let mut h = blake3::Hasher::new();
-                h.update(&val.to_le_bytes());
-                h.update(&[k as u8]);
-                let out = h.finalize();
-                val = u32::from_le_bytes([out.as_bytes()[0], out.as_bytes()[1], out.as_bytes()[2], out.as_bytes()[3]]);
+        for comp in &mut comps {
+            loop {
+                let mut buf = [0u8; 4];
+                reader.fill(&mut buf);
+                let val = u32::from_le_bytes(buf);
+                if val < P as u32 {
+                    *comp = F::from_u32(val);
+                    break;
+                }
+                // Rejection: val >= P, XOF automatically advances to next bytes
             }
-            *comp = F::from_u32(val);
         }
         vec.push(EF::from_basis_coefficients_slice(&comps).unwrap());
     }
@@ -404,13 +421,19 @@ impl VerifyResult {
 }
 
 /// Verify ZODA proof from commitment + opened rows/columns.
-/// The verifier does NOT need the full encoding — only the commitment.
+/// Re-derives random vectors from the roots (doesn't trust the prover).
 pub fn verify(
     comm: &ZodaCommitment,
     row_openings: &[RowOpening],
     col_openings: &[ColOpening],
 ) -> VerifyResult {
     let plan_col = NttPlan::new(comm.m.trailing_zeros() as usize);
+    let plan_row = NttPlan::new(comm.m_prime.trailing_zeros() as usize);
+
+    // Re-derive random vectors from roots (Fiat-Shamir)
+    let seed = fs_seed(&comm.root_rows, &comm.root_cols);
+    let g_bar: Vec<EF> = derive_ef_vector(&seed, comm.m_prime, b"ZODA_G_BAR");
+    let g_bar_prime: Vec<EF> = derive_ef_vector(&seed, comm.m, b"ZODA_G_BAR_PRIME");
 
     // Verify Merkle proofs (domain-separated hashes)
     let mut merkle_ok = true;
@@ -422,59 +445,34 @@ pub fn verify(
     }
 
     // Check 6: W_S · ḡ_r = G_S · z_r
-    // LHS: sum_j Z[i][j] * ḡ_r[j] for each opened row i
-    // RHS: (G · z_r)[i] — column-code NTT of z_r (decomposed into 5 base-field NTTs)
-    let g_zr: Vec<EF> = {
-        let comps: Vec<Vec<F>> = (0..DIM).map(|k| {
-            let coeffs: Vec<F> = comm.z_r.iter().map(|ef| ef.as_basis_coefficients_slice()[k]).collect();
-            plan_col.fwd_poly(&coeffs)
-        }).collect();
-        (0..comm.m).map(|i| {
-            EF::from_basis_coefficients_slice(&[
-                comps[0][i], comps[1][i], comps[2][i], comps[3][i], comps[4][i],
-            ]).unwrap()
-        }).collect()
-    };
+    let g_zr = plan_col.fwd_poly_ef(&comm.z_r);
 
     let mut row_checks = 0usize;
     let mut row_passed = 0usize;
     for ro in row_openings {
         let mut lhs = EF::ZERO;
-        for j in 0..comm.m_prime { lhs += EF::from(ro.data[j]) * comm.g_bar[j]; }
-        let rhs = g_zr[ro.index];
+        for j in 0..comm.m_prime { lhs += EF::from(ro.data[j]) * g_bar[j]; }
         row_checks += 1;
-        if lhs == rhs { row_passed += 1; }
+        if lhs == g_zr[ro.index] { row_passed += 1; }
     }
 
     // Check 7: (Y^T)_{S'} · ḡ'_{r'} = G'_{S'} · z'_{r'}
-    let plan_row = NttPlan::new(comm.m_prime.trailing_zeros() as usize);
-    let g_prime_zrp: Vec<EF> = {
-        let comps: Vec<Vec<F>> = (0..DIM).map(|k| {
-            let coeffs: Vec<F> = comm.z_r_prime.iter().map(|ef| ef.as_basis_coefficients_slice()[k]).collect();
-            plan_row.fwd_poly(&coeffs)
-        }).collect();
-        (0..comm.m_prime).map(|i| {
-            EF::from_basis_coefficients_slice(&[
-                comps[0][i], comps[1][i], comps[2][i], comps[3][i], comps[4][i],
-            ]).unwrap()
-        }).collect()
-    };
+    let g_prime_zrp = plan_row.fwd_poly_ef(&comm.z_r_prime);
 
     let mut col_checks = 0usize;
     let mut col_passed = 0usize;
     for co in col_openings {
         let mut lhs = EF::ZERO;
-        for i in 0..comm.m { lhs += EF::from(co.data[i]) * comm.g_bar_prime[i]; }
-        let rhs = g_prime_zrp[co.index];
+        for i in 0..comm.m { lhs += EF::from(co.data[i]) * g_bar_prime[i]; }
         col_checks += 1;
-        if lhs == rhs { col_passed += 1; }
+        if lhs == g_prime_zrp[co.index] { col_passed += 1; }
     }
 
     // Check 8: ḡ'^T_{r'} · G · z_r = ḡ^T_r · G' · z'_{r'}
     let mut cross_lhs = EF::ZERO;
-    for i in 0..comm.m { cross_lhs += comm.g_bar_prime[i] * g_zr[i]; }
+    for i in 0..comm.m { cross_lhs += g_bar_prime[i] * g_zr[i]; }
     let mut cross_rhs = EF::ZERO;
-    for j in 0..comm.m_prime { cross_rhs += comm.g_bar[j] * g_prime_zrp[j]; }
+    for j in 0..comm.m_prime { cross_rhs += g_bar[j] * g_prime_zrp[j]; }
 
     VerifyResult {
         row_checks, row_passed,
@@ -519,21 +517,21 @@ pub fn decode_from_rows(z_rows: &[Vec<F>], m: usize, m_prime: usize, n: usize, n
 //  Sampling helpers
 // ═══════════════════════════════════════════════════════════════════════════
 
-/// Generate unique sample indices via BLAKE3-keyed stream (cryptographic PRNG).
+/// Generate unique sample indices via BLAKE3 XOF (cryptographic PRNG).
 pub fn sample_indices(root: &Hash, domain_sep: u32, count: usize, modulus: usize) -> Vec<usize> {
     assert!(count <= modulus);
+    let mut hasher = blake3::Hasher::new_keyed(root);
+    hasher.update(&domain_sep.to_le_bytes());
+    let mut reader = hasher.finalize_xof();
+
     let mut indices = Vec::with_capacity(count);
     let mut seen = vec![false; modulus];
-    let mut ctr = 0u64;
     while indices.len() < count {
-        let mut hasher = blake3::Hasher::new_keyed(root);
-        hasher.update(&domain_sep.to_le_bytes());
-        hasher.update(&ctr.to_le_bytes());
-        let out = hasher.finalize();
-        let val = u64::from_le_bytes(out.as_bytes()[..8].try_into().unwrap());
+        let mut buf = [0u8; 8];
+        reader.fill(&mut buf);
+        let val = u64::from_le_bytes(buf);
         let idx = (val as usize) % modulus;
         if !seen[idx] { seen[idx] = true; indices.push(idx); }
-        ctr += 1;
     }
     indices
 }
