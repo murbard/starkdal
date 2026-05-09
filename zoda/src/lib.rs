@@ -34,8 +34,11 @@ fn hash_f_slice_tagged(tag: u8, data: &[F]) -> Hash {
 const TAG_ROW: u8 = 0x00;
 const TAG_COL: u8 = 0x01;
 
+const TAG_INTERNAL: u8 = 0x02;
+
 fn hash_pair(left: &Hash, right: &Hash) -> Hash {
     let mut hasher = blake3::Hasher::new();
+    hasher.update(&[TAG_INTERNAL]);
     hasher.update(left);
     hasher.update(right);
     *hasher.finalize().as_bytes()
