@@ -3,6 +3,14 @@
 //! Standard tensor code Z = G·X̃·G'^T entirely over base field F (4× expansion).
 //! Proof of correct encoding via two short random-linear-combination vectors
 //! z_r and z'_{r'} in extension field E. All NTTs are base-field.
+//!
+//! ## Key types
+//!
+//! - [`encode`] — encodes data matrix, produces [`ZodaEncoding`]
+//! - [`ZodaCommitment`] — what the verifier receives (roots + proof vectors)
+//! - [`verify`] — checks consistency from commitment + opened rows/columns
+//! - [`decode_from_rows`] — recovers original data from Z rows
+//! - [`NttPlan`] — reusable SIMD NTT plan backed by concrete-ntt
 
 pub use backend::*;
 #[allow(unused_imports)]

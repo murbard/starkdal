@@ -11,46 +11,62 @@ Experimental prototypes for Data Availability Layer (DAL) commitment schemes. Tw
 
 Implementation of the ZODA tensor variation (Appendix E of [Evans, Mohnblatt, Angeris 2025/034](https://eprint.iacr.org/2025/034)). The standard tensor code Z = G·X̃·G'^T is entirely over the base field — **4× expansion, zero encoding overhead**. Proof of correct encoding via two short vectors in the extension field.
 
-Uses [concrete-ntt](https://crates.io/crates/concrete-ntt) for SIMD-optimized negacyclic NTTs over KoalaBear (p = 2^31 - 2^24 + 1). BLAKE3 for Merkle commitments.
+Uses [concrete-ntt](https://crates.io/crates/concrete-ntt) for SIMD-optimized negacyclic NTTs over KoalaBear (p = 2^31 - 2^24 + 1). BLAKE3 for Merkle commitments (domain-separated leaf/internal nodes).
 
 ```bash
 cd zoda
 cargo run --release -- --n 4096              # 64 MB encode
 cargo run --release -- --n 4096 --decode     # + roundtrip decode verification
-cargo run --release -- --n 8192              # 256 MB encode
+cargo run --release -- --n 8192 --samples 50 # 256 MB, 50 samples per dimension
 ```
 
 ### Benchmarks (Graviton4, c8g.8xlarge, 32 cores)
 
-| Data | Encoded | Encode time | **Throughput** | NTT throughput |
-|---|---|---|---|---|
-| 16 MB | 64 MB | 0.023s | **701 MB/s** | 1.6 GB/s |
-| 64 MB | 256 MB | 0.081s | **787 MB/s** | 1.8 GB/s |
-| 256 MB | 1 GB | 0.334s | **768 MB/s** | 1.8 GB/s |
-| 1 GB | 4 GB | 1.684s | **608 MB/s** | 1.6 GB/s |
+| Data | Encoded | Encode | **Throughput** | NTT | Verify |
+|---|---|---|---|---|---|
+| 16 MB | 64 MB | 0.030s | **526 MB/s** | 1.7 GB/s | 10ms |
+| 64 MB | 256 MB | 0.097s | **658 MB/s** | 1.9 GB/s | 19ms |
+| 256 MB | 1 GB | 0.360s | **711 MB/s** | 1.9 GB/s | 39ms |
+| 1 GB | 4 GB | 1.635s | **627 MB/s** | 1.7 GB/s | 78ms |
 
 ### Why the tensor variation (Appendix E)?
 
-The original ZODA field-extension variant (Section 5) stores Y over a quintic extension field, causing **12× data expansion** (3× worse than the standard 4×). The tensor variation keeps everything in the base field: Z = G·X̃·G'^T with 4× expansion, and the proof is just two short EF vectors (negligible network cost). See the [paper](https://eprint.iacr.org/2025/034) Section 5 vs Appendix E.
+The original ZODA field-extension variant (Section 5) stores Y over a quintic extension field, causing **12× data expansion** (3× worse than the standard 4×). The paper explicitly notes: *"this does not result in a zero-overhead protocol since the field extension's elements do not carry additional information that can reconstruct the corresponding rows."*
+
+The tensor variation keeps everything in the base field: Z = G·X̃·G'^T with 4× expansion, and the proof is just two short EF vectors (negligible network cost).
 
 ### Architecture
 
 | Component | Implementation |
 |---|---|
 | RS encoding | concrete-ntt negacyclic NTT (SIMD: AVX2/NEON) |
-| Merkle commitment | BLAKE3, raw Montgomery byte hashing |
-| Fiat-Shamir | BLAKE3 sponge for random EF vectors |
-| Field | KoalaBear (31-bit) + quintic extension for proof vectors |
+| Merkle commitment | BLAKE3, domain-separated (TAG_ROW/TAG_COL/TAG_INTERNAL) |
+| Fiat-Shamir | BLAKE3 XOF seeded from both Merkle roots |
+| Random sampling | BLAKE3 XOF with rejection sampling |
+| Field | KoalaBear (31-bit) + quintic extension for proof vectors only |
 
-Full protocol: encode, open (row/column Merkle proofs), verify (3 consistency checks), decode.
+Full protocol: encode, open (row/column Merkle proofs), verify (row check, column check, cross check), decode.
+
+The verifier receives only the `ZodaCommitment` (two Merkle roots + two proof vectors) and re-derives random vectors via Fiat-Shamir — no trust in the prover beyond the commitment.
+
+### Performance notes
+
+The NTT runs at **1.9 GB/s** (concrete-ntt with NEON). The encode throughput is lower because of:
+- Column gather: reading columns from row-major intermediate results (strided memory access)
+- Proof vectors: additional column NTTs + extension-field dot products
+- Merkle hashing: BLAKE3 over ~1 GB of encoded data
+
+The NTT expansion ratio is 6× (rate-1/2 row encoding × rate-1/2 column encoding × 1.5 for proof vector NTTs). At 1.9 GB/s NTT throughput, the theoretical peak is ~317 MB/s per machine — we achieve ~70% of that.
 
 ## STARK-based (`leanvm/`)
 
 Built on [leanEthereum/leanMultisig](https://github.com/leanEthereum/leanMultisig)'s minimal zkVM (WHIR + SuperSpartan, KoalaBear field, Poseidon16 precompile).
 
-Three circuit strategies:
+Three circuit strategies, numbered by progression:
 
 ### 1. FFT + Merkle (baseline)
+
+Prove the coset FFT and Merkle tree directly in-circuit. Simple but expensive.
 
 ```bash
 cd leanvm
@@ -59,14 +75,17 @@ cargo run --release --example bench_fft_unroll -- --log-n 12
 
 ### 2. Syndrome check
 
+Verify RS membership via batched syndrome check (Schwartz-Zippel). Uses barycentric-style 1/(β - x_j) weights. Supports chunked parallel proving with shared bytecode.
+
 ```bash
 cargo run --release --example bench_syndrome_unroll -- --log-n 12
-cargo run --release --example bench_chunked -- --log-n 22 --log-chunk 12
+cargo run --release --example bench_chunked -- --log-n 22 --log-chunk 12 --concurrency 8
+cargo run --release --example bench_recursive -- --log-n 22 --arity 8
 ```
 
 ### 3. RLC + fold (fastest STARK approach)
 
-Batch m codewords via Random Linear Combination using extension-field precompiles, then fold with random challenges.
+Batch m codewords via Random Linear Combination using extension-field precompiles (`dot_product_be`), then fold with random challenges (`dot_product_ee` + `add_ee`).
 
 ```bash
 cargo run --release --example bench_fri_fold -- --log-poly 11 --m 510
@@ -85,14 +104,13 @@ cargo run --release --example bench_fri_fold -- --log-poly 11 --m 510 --batches 
 
 | | STARK (RLC+fold) | ZODA (tensor) |
 |---|---|---|
-| 64 MB encode | 11.6s | **0.081s** (140× faster) |
-| Throughput | 1.4 MB/s | **787 MB/s** |
+| 64 MB throughput | 1.4 MB/s | **658 MB/s** (470× faster) |
 | Proof size | ~400 KB | N/A (encoding IS proof) |
 | Verifier downloads | 400 KB proof | ~3 MB (sampled rows+cols) |
-| Data expansion | 4× (bumped ext-op limit) | 4× (standard tensor code) |
+| Data expansion | 4× | 4× |
 | Security model | STARK proof (succinct) | Sampling (probabilistic) |
 
-ZODA is 140× faster but requires the verifier to download rows and columns of the encoding. The STARK approach produces a compact proof that any third party can verify without the full encoding.
+ZODA is ~500× faster but requires the verifier to download rows and columns of the encoding. The STARK approach produces a compact proof that any third party can verify without the full encoding.
 
 ## Why "the dumb way"
 
