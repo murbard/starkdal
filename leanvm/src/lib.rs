@@ -1,4 +1,10 @@
 //! Shared infrastructure for RS codeword commitment benchmarks.
+//!
+//! Provides field helpers, circuit parameter computation, reference implementations
+//! (coset FFT, Merkle trees, syndrome checks), zkDSL code generation utilities,
+//! and a benchmark harness for proving and verifying leanVM circuits.
+//!
+//! Used by all `examples/bench_*.rs` binaries.
 
 use std::collections::HashMap;
 use std::time::Instant;

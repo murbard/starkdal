@@ -4,7 +4,9 @@
 //! (shared bytecode, per-chunk coset offsets via public input), then
 //! verifies partial syndrome sums add to zero.
 //!
-//! Usage: cargo run --release --example bench_chunked -- --log-n 22 --log-chunk 12 --concurrency 8
+//! Usage:
+//!   cargo run --release --example bench_chunked -- --log-n 22 --log-chunk 12
+//!   cargo run --release --example bench_chunked -- --log-n 22 --log-chunk 12 --concurrency 8
 
 use rayon::prelude::*;
 use starkdal_leanvm::*;

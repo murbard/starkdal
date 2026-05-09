@@ -1,7 +1,5 @@
 # Build artifacts
 target/
-stwo/target/
-leanvm/target/
 
 # Credentials
 .aws
@@ -12,13 +10,8 @@ leanvm/target/
 __pycache__/
 *.pyc
 
-# OS
+# OS / editor
 .DS_Store
-
-# Editor
 .vscode/
 .idea/
 .claude/
-
-# LaTeX
-*.synctex.gz

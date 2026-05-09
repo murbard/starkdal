@@ -16,12 +16,18 @@ pub use backend::*;
 #[allow(unused_imports)]
 use rayon::prelude::*;
 
+/// Base field: KoalaBear (p = 2^31 - 2^24 + 1, 31-bit prime, Montgomery form).
 pub type F = KoalaBear;
+/// Extension field: degree-5 over KoalaBear (|E| ~ 2^155, for proof vector security).
 pub type EF = QuinticExtensionFieldKB;
 
+/// KoalaBear prime.
 pub const P: u64 = 0x7F000001;
+/// Extension field degree.
 pub const DIM: usize = 5;
+/// BLAKE3 output size in bytes.
 pub const HASH_LEN: usize = 32;
+/// A BLAKE3 hash digest.
 pub type Hash = [u8; HASH_LEN];
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -213,24 +219,42 @@ impl MerkleProof {
 //  ZODA Tensor Variation (Appendix E)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Breakdown of encode wall-clock time by phase.
 pub struct EncodeTiming {
+    /// Row encode: W' = X̃·G'^T (n base-field NTTs of size m').
     pub row_fft: std::time::Duration,
+    /// Column encode: Z = G·W' (m' base-field NTTs of size m).
     pub col_fft: std::time::Duration,
+    /// Merkle commitment of Z (two trees: by rows and by columns).
     pub commit: std::time::Duration,
+    /// Proof vector computation (Fiat-Shamir + EF dot products + extra column NTTs).
     pub proof_vecs: std::time::Duration,
+    /// Total wall time including all overhead.
     pub total: std::time::Duration,
 }
 
+/// Full encoding output. Contains the encoded matrix Z, Merkle trees,
+/// proof vectors, and timing breakdown.
 pub struct ZodaEncoding {
-    pub tree_rows: MerkleTree,   // commit Z by rows
-    pub tree_cols: MerkleTree,   // commit Z by columns
-    pub z_col_vecs: Vec<Vec<F>>, // z_col_vecs[col][row], m' columns of length m
-    pub z_r: Vec<EF>,            // proof vector (length n)
-    pub z_r_prime: Vec<EF>,      // proof vector (length n')
+    /// Merkle tree committing Z row-by-row.
+    pub tree_rows: MerkleTree,
+    /// Merkle tree committing Z column-by-column.
+    pub tree_cols: MerkleTree,
+    /// Z in column-major layout: `z_col_vecs[col][row]` (m' columns of length m).
+    pub z_col_vecs: Vec<Vec<F>>,
+    /// Proof vector z_r = (X̃·G'^T)·ḡ_r (length n, in extension field).
+    pub z_r: Vec<EF>,
+    /// Proof vector z'_{r'} = (G·X̃)^T·ḡ'_{r'} (length n', in extension field).
+    pub z_r_prime: Vec<EF>,
+    /// Number of data rows.
     pub n: usize,
+    /// Number of data columns.
     pub n_prime: usize,
+    /// Codeword length for column code (= 2n).
     pub m: usize,
+    /// Codeword length for row code (= 2n').
     pub m_prime: usize,
+    /// Per-phase timing breakdown.
     pub timing: EncodeTiming,
 }
 
@@ -392,7 +416,9 @@ fn derive_ef_vector(seed: &Hash, len: usize, domain: &[u8]) -> Vec<EF> {
 //  Openings
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// A row of Z with its Merkle authentication path.
 pub struct RowOpening { pub index: usize, pub data: Vec<F>, pub proof: MerkleProof }
+/// A column of Z with its Merkle authentication path.
 pub struct ColOpening { pub index: usize, pub data: Vec<F>, pub proof: MerkleProof }
 
 impl ZodaEncoding {
@@ -413,12 +439,19 @@ impl ZodaEncoding {
 //  Verification (Appendix E sampling algorithm)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Outcome of the ZODA verification protocol (three checks + Merkle proofs).
 pub struct VerifyResult {
+    /// Number of row consistency checks attempted.
     pub row_checks: usize,
+    /// Number of row consistency checks passed.
     pub row_passed: usize,
+    /// Number of column consistency checks attempted.
     pub col_checks: usize,
+    /// Number of column consistency checks passed.
     pub col_passed: usize,
+    /// Whether the cross-check (ḡ'^T · G · z_r = ḡ^T · G' · z'_{r'}) passed.
     pub cross_check: bool,
+    /// Whether all Merkle proofs verified against the committed roots.
     pub merkle_ok: bool,
 }
 
