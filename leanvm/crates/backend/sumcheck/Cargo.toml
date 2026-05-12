@@ -11,5 +11,12 @@ fiat-shamir = { path = "../fiat-shamir", package = "mt-fiat-shamir" }
 tracing.workspace = true
 rayon.workspace = true
 
+gpu-sumcheck = { path = "../../../../gpu/sumcheck", optional = true }
+gpu-poly-fold = { path = "../../../../gpu/poly_fold", optional = true }
+cudarc = { version = "0.16", features = ["cuda-12060"], optional = true }
+
+[features]
+gpu = ["dep:gpu-sumcheck", "dep:gpu-poly-fold", "dep:cudarc"]
+
 [dev-dependencies]
 koala-bear = { path = "../koala-bear", package = "mt-koala-bear" }
