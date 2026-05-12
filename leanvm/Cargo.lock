@@ -581,6 +581,12 @@ name = "lean_prover"
 version = "0.1.0"
 dependencies = [
  "backend",
+ "cudarc",
+ "gpu-merkle",
+ "gpu-ntt",
+ "gpu-poly-fold",
+ "gpu-pow-grind",
+ "gpu-sumcheck",
  "itertools",
  "lean_compiler",
  "lean_vm",
@@ -681,6 +687,7 @@ dependencies = [
 name = "mt-fiat-shamir"
 version = "0.1.0"
 dependencies = [
+ "gpu-pow-grind",
  "mt-field",
  "mt-koala-bear",
  "mt-symetric",
@@ -737,6 +744,9 @@ dependencies = [
 name = "mt-sumcheck"
 version = "0.1.0"
 dependencies = [
+ "cudarc",
+ "gpu-poly-fold",
+ "gpu-sumcheck",
  "mt-air",
  "mt-fiat-shamir",
  "mt-field",

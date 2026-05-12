@@ -13,6 +13,9 @@ mod trace_gen;
 pub mod prove_execution;
 pub mod verify_execution;
 
+#[cfg(feature = "gpu")]
+pub mod gpu_prove_execution;
+
 #[cfg(test)]
 mod test_zkvm;
 

@@ -8,6 +8,7 @@ workspace = true
 
 [features]
 prox-gaps-conjecture = []
+gpu = ["dep:gpu-sumcheck", "dep:gpu-poly-fold", "dep:gpu-ntt", "dep:gpu-merkle", "dep:gpu-pow-grind", "dep:cudarc"]
 
 [dependencies]
 pest.workspace = true
@@ -21,6 +22,13 @@ lean_vm.workspace = true
 lean_compiler.workspace = true
 backend.workspace = true
 itertools.workspace = true
+
+gpu-sumcheck = { path = "../../../gpu/sumcheck", optional = true }
+gpu-poly-fold = { path = "../../../gpu/poly_fold", optional = true }
+gpu-ntt = { path = "../../../gpu/ntt", optional = true }
+gpu-merkle = { path = "../../../gpu/merkle", optional = true }
+gpu-pow-grind = { path = "../../../gpu/pow_grind", optional = true }
+cudarc = { version = "0.16", features = ["cuda-12060"], optional = true }
 
 [dev-dependencies]
 xmss.workspace = true
