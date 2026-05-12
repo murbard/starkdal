@@ -1198,6 +1198,8 @@ name = "sub_protocols"
 version = "0.1.0"
 dependencies = [
  "backend",
+ "cudarc",
+ "gpu-sumcheck",
  "lean_vm",
  "rand",
  "tracing",

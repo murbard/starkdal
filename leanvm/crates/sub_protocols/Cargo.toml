@@ -13,6 +13,12 @@ utils.workspace = true
 lean_vm.workspace = true
 backend.workspace = true
 
+gpu-sumcheck = { path = "../../../gpu/sumcheck", optional = true }
+cudarc = { version = "0.16", features = ["cuda-12060"], optional = true }
+
+[features]
+gpu = ["dep:gpu-sumcheck", "dep:cudarc"]
+
 [dev-dependencies]
 
 rand.workspace = true
