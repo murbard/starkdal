@@ -19,15 +19,15 @@ pub use config::*;
 mod merkle;
 pub use merkle::DIGEST_ELEMS;
 pub use merkle::WhirMerkleTree;
-pub use utils::sample_ood_points;
-pub use matrix::DenseMatrix;
 pub(crate) use merkle::*;
 
 mod utils;
 pub use utils::precompute_dft_twiddles;
+// sample_ood_points is pub(crate) — users should inline it or access via the whir crate.
 pub(crate) use utils::*;
 
 mod matrix;
+pub use matrix::DenseMatrix;
 pub(crate) use matrix::*;
 
 #[cfg(feature = "gpu")]

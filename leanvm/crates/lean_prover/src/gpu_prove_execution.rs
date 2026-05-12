@@ -190,13 +190,21 @@ pub fn gpu_prove_execution(
 
             // OOD evaluation (CPU for now).
             let whir_cfg = WhirConfig::<EF>::new(whir_config, stacked_n_vars);
-            let (ood_points, ood_answers) = sample_ood_points::<EF, _>(
-                &mut prover_state, whir_cfg.commitment_ood_samples, stacked_n_vars,
-                |point| {
-                    let mle = MleOwned::Base(global_poly.clone());
-                    mle.evaluate(point)
-                },
-            );
+            // Inline sample_ood_points (not public from whir crate).
+            let (ood_points, ood_answers) = {
+                let num_samples = whir_cfg.commitment_ood_samples;
+                let mut pts = Vec::new();
+                let mut ans = Vec::new();
+                if num_samples > 0 {
+                    pts = prover_state.sample_vec(num_samples);
+                    let mle = MleOwned::<EF>::Base(global_poly.clone());
+                    ans.extend(pts.iter().map(|p| {
+                        mle.evaluate(&MultilinearPoint::expand_from_univariate(*p, stacked_n_vars))
+                    }));
+                    prover_state.add_extension_scalars(&ans);
+                }
+                (pts, ans)
+            };
 
             let inner_witness = Witness { prover_data, ood_points, ood_answers };
             let global_polynomial = MleOwned::Base(global_poly);
