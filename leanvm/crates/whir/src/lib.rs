@@ -18,6 +18,9 @@ pub use config::*;
 
 mod merkle;
 pub use merkle::DIGEST_ELEMS;
+pub use merkle::WhirMerkleTree;
+pub use utils::sample_ood_points;
+pub use matrix::DenseMatrix;
 pub(crate) use merkle::*;
 
 mod utils;

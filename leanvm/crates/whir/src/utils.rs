@@ -27,7 +27,7 @@ pub(crate) fn get_challenge_stir_queries<F: Field, Chal: ChallengeSampler<F>>(
 /// A utility function to sample Out-of-Domain (OOD) points and evaluate them.
 ///
 /// This should be used on the prover side.
-pub(crate) fn sample_ood_points<EF: ExtensionField<PF<EF>>, E>(
+pub fn sample_ood_points<EF: ExtensionField<PF<EF>>, E>(
     prover_state: &mut impl FSProver<EF>,
     num_samples: usize,
     num_variables: usize,

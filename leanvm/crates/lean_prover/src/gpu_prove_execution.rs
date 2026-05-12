@@ -11,7 +11,6 @@ use backend::*;
 use lean_vm::*;
 use sub_protocols::*;
 use tracing::info_span;
-use utils::ansi::Colorize;
 use utils::{build_prover_state, from_end};
 
 struct Gpu {
@@ -118,12 +117,96 @@ pub fn gpu_prove_execution(
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 4-5: Polynomial stacking + WHIR commit
-    // TODO: Reimplement on GPU (DFT→Merkle on device)
-    // For now: CPU
+    // GPU: DFT→Merkle chained on device. Upload polynomial once.
     // ═══════════════════════════════════════════════════════════════════
-    let stacked_pcs_witness = stack_polynomials_and_commit(
-        &mut prover_state, whir_config, &memory, &memory_acc, &bytecode_acc, &traces,
-    );
+    let stacked_pcs_witness = info_span!("GPU stack+commit").in_scope(|| {
+        let g = gpu();
+        if let Some(g) = g {
+            // Build stacked polynomial (CPU, just memcpy).
+            let tables_heights = traces.iter().map(|(t,tr)| (*t, tr.log_n_rows)).collect();
+            let tables_sorted = sort_tables_by_height(&tables_heights);
+            let stacked_n_vars = compute_stacked_n_vars(
+                log2_strict_usize(memory.len()),
+                log2_strict_usize(bytecode_acc.len()),
+                &tables_sorted.iter().cloned().collect(),
+            );
+            let mut global_poly = F::zero_vec(1 << stacked_n_vars);
+            global_poly[..memory.len()].copy_from_slice(&memory);
+            let mut offset = memory.len();
+            global_poly[offset..][..memory_acc.len()].copy_from_slice(&memory_acc);
+            offset += memory_acc.len();
+            global_poly[offset..][..bytecode_acc.len()].copy_from_slice(&bytecode_acc);
+            let largest_h = 1 << tables_sorted[0].1;
+            offset += largest_h.max(bytecode_acc.len());
+            let actual_data_len_start = offset;
+            for (table, log_n_rows) in &tables_sorted {
+                let nr = 1 << *log_n_rows;
+                for ci in 0..table.n_columns() {
+                    global_poly[offset..][..nr].copy_from_slice(&traces[table].columns[ci][..nr]);
+                    offset += nr;
+                }
+            }
+            let actual_data_len = offset;
+            tracing::info!("stacked PCS data: {} = 2^{}", actual_data_len, stacked_n_vars);
+
+            // Upload to GPU.
+            let poly_u32: &[u32] = unsafe {
+                std::slice::from_raw_parts(global_poly.as_ptr().cast(), global_poly.len())
+            };
+            let d_poly = g.stream.memcpy_stod(poly_u32).unwrap();
+
+            // GPU DFT → GPU Merkle.
+            let ff = whir_config.folding_factor.at_round(0);
+            let n_blocks = 1usize << ff;
+            let effective_n_cols = actual_data_len.div_ceil((1 << stacked_n_vars) / n_blocks);
+            let n_evals = (1u32 << stacked_n_vars);
+            let n_cols = n_blocks as u32;
+
+            let d_dft = g.ntt.reorder_and_dft_device(&d_poly, n_evals, ff, whir_config.starting_log_inv_rate);
+            let full_len = (n_evals as u64) << whir_config.starting_log_inv_rate;
+            let height = (full_len / n_cols as u64) as u32;
+            let (root_u32, merkle_layers) = g.merkle.build_tree_from_device(&d_dft, height, n_cols, n_cols);
+
+            // Download DFT output for CPU-side operations.
+            let dft_flat = g.stream.memcpy_dtov(&d_dft).unwrap();
+            let dft_pf: Vec<F> = unsafe { std::mem::transmute(dft_flat) };
+
+            // Construct leanVM types from GPU results.
+            let dft_matrix = DenseMatrix::new(dft_pf, n_blocks);
+            let digest_layers: Vec<Vec<[F; DIGEST_ELEMS]>> = merkle_layers.iter().map(|layer| {
+                let n = layer.len() / DIGEST_ELEMS;
+                (0..n).map(|i| {
+                    let mut d = [F::ZERO; DIGEST_ELEMS];
+                    for j in 0..DIGEST_ELEMS { d[j] = unsafe { std::mem::transmute(layer[i*DIGEST_ELEMS+j]) }; }
+                    d
+                }).collect()
+            }).collect();
+            let tree = backend::merkle::MerkleTree { digest_layers };
+            let whir_tree = WhirMerkleTree { leaf: dft_matrix, tree, full_leaf_base_width: n_blocks };
+            let root: [F; DIGEST_ELEMS] = whir_tree.root();
+            let prover_data = MerkleData::Base(whir_tree);
+
+            prover_state.add_base_scalars(&root);
+
+            // OOD evaluation (CPU for now).
+            let whir_cfg = WhirConfig::<EF>::new(whir_config, stacked_n_vars);
+            let (ood_points, ood_answers) = sample_ood_points::<EF, _>(
+                &mut prover_state, whir_cfg.commitment_ood_samples, stacked_n_vars,
+                |point| {
+                    let mle = MleOwned::Base(global_poly.clone());
+                    mle.evaluate(point)
+                },
+            );
+
+            let inner_witness = Witness { prover_data, ood_points, ood_answers };
+            let global_polynomial = MleOwned::Base(global_poly);
+
+            StackedPcsWitness { stacked_n_vars, inner_witness, global_polynomial }
+        } else {
+            // CPU fallback.
+            stack_polynomials_and_commit(&mut prover_state, whir_config, &memory, &memory_acc, &bytecode_acc, &traces)
+        }
+    });
 
     // ═══════════════════════════════════════════════════════════════════
     // STEP 6: Logup (GKR)

@@ -179,7 +179,7 @@ pub fn stacked_pcs_parse_commitment(
     WhirConfig::new(whir_config_builder, stacked_n_vars).parse_commitment(verifier_state)
 }
 
-fn compute_stacked_n_vars(
+pub fn compute_stacked_n_vars(
     log_memory: usize,
     log_bytecode: usize,
     tables_log_heights: &BTreeMap<Table, VarCount>,

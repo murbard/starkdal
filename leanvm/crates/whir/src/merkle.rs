@@ -164,9 +164,9 @@ pub(crate) fn merkle_verify<F: Field, EF: ExtensionField<F>>(
 
 #[derive(Debug, Clone)]
 pub struct WhirMerkleTree<F, M, const DIGEST_ELEMS: usize> {
-    pub(crate) leaf: M,
-    pub(crate) tree: symetric::merkle::MerkleTree<F, DIGEST_ELEMS>,
-    pub(crate) full_leaf_base_width: usize,
+    pub leaf: M,
+    pub tree: symetric::merkle::MerkleTree<F, DIGEST_ELEMS>,
+    pub full_leaf_base_width: usize,
 }
 
 impl<F: Clone + Copy + Default + Send + Sync, M: Matrix<F>, const DIGEST_ELEMS: usize>
