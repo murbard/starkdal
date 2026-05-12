@@ -127,8 +127,8 @@ impl GpuNtt {
     /// `width`: number of columns.
     /// Maximum number of layers to fuse in shared memory.
     /// Limited by shared memory size: 2^FUSED_LOG elements × 4 bytes.
-    /// 2^12 = 4096 elements = 16 KB shared memory — safe for all GPUs.
-    const FUSED_LOG: usize = 12;
+    /// 2^13 = 8192 elements = 32 KB shared memory — fits on all modern GPUs.
+    const FUSED_LOG: usize = 13;
 
     pub fn dft_in_place(
         &self,
