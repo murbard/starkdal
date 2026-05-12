@@ -135,3 +135,43 @@ pub fn gpu_stack_polynomial(
     let d_stacked = gpu.stream.memcpy_stod(&stacked).unwrap();
     (d_stacked, stacked_n_vars)
 }
+
+/// Phase 2: WHIR commit on GPU.
+/// Reorder → DFT → Merkle, all on device. Downloads only root (32 bytes)
+/// and DFT output (for CPU-side OOD evaluation + Merkle path opening).
+pub fn gpu_whir_commit(
+    gpu: &GpuProverContext,
+    d_stacked: &CudaSlice<u32>,
+    stacked_n_vars: usize,
+    folding_factor: usize,
+    log_inv_rate: usize,
+) -> (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) {
+    let n_evals = 1u32 << stacked_n_vars;
+    let n_cols = 1u32 << folding_factor;
+
+    // Reorder + DFT on device.
+    let d_dft = gpu.ntt.reorder_and_dft_device(d_stacked, n_evals, folding_factor, log_inv_rate);
+
+    // Merkle on DFT output (device-resident, no re-upload).
+    let full_len = (n_evals as u64) << log_inv_rate;
+    let height = (full_len / n_cols as u64) as u32;
+    let (root_flat, layers_flat) = gpu.merkle.build_tree_from_device(
+        &d_dft, height, n_cols, n_cols,
+    );
+
+    // Download DFT for CPU-side operations (OOD eval, Merkle path opening).
+    let dft_flat = gpu.stream.memcpy_dtov(&d_dft).unwrap();
+
+    (root_flat, dft_flat, layers_flat)
+}
+
+/// Phase 3: OOD evaluation on GPU (multilinear evaluation at sampled points).
+/// For now, downloads polynomial and evaluates on CPU (the evaluation is tiny).
+pub fn cpu_ood_eval(
+    stacked_poly: &[u32],  // downloaded stacked polynomial
+    point: &[[u32; 5]],    // extension field point coordinates
+) -> [u32; 5] {
+    // TODO: use gpu_trace_ops::mle_eval for GPU evaluation
+    gpu_trace_ops::cpu_mle_eval(stacked_poly, point)
+}
+
