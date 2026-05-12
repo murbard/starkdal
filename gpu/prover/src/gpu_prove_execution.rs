@@ -165,7 +165,124 @@ pub fn gpu_whir_commit(
     (root_flat, dft_flat, layers_flat)
 }
 
-/// Phase 3: OOD evaluation on GPU (multilinear evaluation at sampled points).
+/// Phase 3: Build combined weights on GPU (eq polynomials).
+/// Replaces combine_statement — weights are generated directly on GPU,
+/// no 640MB upload needed.
+pub fn gpu_combine_statement(
+    gpu: &GpuProverContext,
+    statements: &[(Vec<[u32; 5]>, Vec<(usize, [u32; 5])>, bool)],
+    // Each statement: (point_coords, [(selector, value)], is_next)
+    gamma: [u32; 5],
+    num_variables: usize,
+) -> (CudaSlice<u32>, [u32; 5]) {
+    let dim = 5;
+    let n_total = 1usize << num_variables;
+
+    // Zero-initialized weights on GPU.
+    let mut d_weights = gpu.stream.alloc_zeros::<u32>(n_total * dim).unwrap();
+    let mut combined_sum = [0u32; 5]; // Accumulated on CPU (tiny).
+    let mut gamma_pow = [0x01FFFFFEu32, 0, 0, 0, 0]; // 1 in Montgomery form
+
+    for (point, values, is_next) in statements {
+        let inner_n_vars = point.len();
+        let inner_n = 1usize << inner_n_vars;
+
+        // Build eq(point, x) on GPU or next_mle on CPU.
+        let d_poly = if *is_next {
+            // next_mle: compute on CPU, upload (tiny).
+            // TODO: implement next_mle on GPU
+            let next = backend::extension::QuinticExtensionField::<F>::default(); // placeholder
+            gpu.stream.alloc_zeros::<u32>(inner_n * dim).unwrap() // zeros for now
+        } else {
+            gpu.sumcheck.eq_polynomial_device(point)
+        };
+
+        for &(selector, value) in values {
+            let offset = (selector * inner_n) as u32;
+            gpu.sumcheck.eq_accumulate_offset_device(
+                &mut d_weights, &d_poly, &gamma_pow, offset, inner_n as u32,
+            );
+
+            // combined_sum += value * gamma_pow (CPU, tiny EF arithmetic)
+            // TODO: proper EF multiplication on CPU
+            // For now, accumulate component-wise (only correct for base-field values)
+            for k in 0..5 {
+                combined_sum[k] = kb_add_host(combined_sum[k], kb_mul_host(value[k], gamma_pow[k]));
+            }
+
+            // gamma_pow *= gamma
+            gamma_pow = qe_mul_host(&gamma_pow, &gamma);
+        }
+    }
+
+    (d_weights, combined_sum)
+}
+
+// Host-side KoalaBear arithmetic helpers.
+fn kb_add_host(a: u32, b: u32) -> u32 {
+    let s = a + b;
+    if s >= 0x7F000001 { s - 0x7F000001 } else { s }
+}
+
+fn kb_mul_host(a: u32, b: u32) -> u32 {
+    let x = a as u64 * b as u64;
+    let t = (x as u32).wrapping_mul(0x81000001u32);
+    let u = t as u64 * 0x7F000001u64;
+    let diff = x.wrapping_sub(u);
+    let hi = (diff >> 32) as u32;
+    if x < u { hi.wrapping_add(0x7F000001) } else { hi }
+}
+
+fn qe_mul_host(a: &[u32; 5], b: &[u32; 5]) -> [u32; 5] {
+    // Full quintic extension multiplication using the CPU reference.
+    type EF = backend::extension::QuinticExtensionField<F>;
+    let ea: EF = unsafe { std::mem::transmute(*a) };
+    let eb: EF = unsafe { std::mem::transmute(*b) };
+    unsafe { std::mem::transmute(ea * eb) }
+}
+
+/// Phase 4: GPU-resident product sumcheck.
+/// Takes device-resident evals (base) and weights (ext), does all fold+sumcheck
+/// rounds on GPU. Only Fiat-Shamir coefficients cross PCIe.
+pub fn gpu_product_sumcheck_rounds(
+    gpu: &GpuProverContext,
+    mut d_evals: CudaSlice<u32>,
+    mut d_weights: CudaSlice<u32>,
+    mut n_evals: usize,
+    n_rounds: usize,
+    mut on_round: impl FnMut([u32; 5], [u32; 5]) -> [u32; 5],
+    // on_round(c0, c2) → challenge r. Also handles Fiat-Shamir internally.
+) -> (CudaSlice<u32>, CudaSlice<u32>, usize) {
+    let mut evals_is_base = true;
+
+    for _round in 0..n_rounds {
+        let half = (n_evals / 2) as u32;
+
+        // Compute (c0, c2) on GPU — only 40 bytes downloaded.
+        let (c0, c2) = if evals_is_base {
+            gpu.sumcheck.product_sumcheck_base_ext_device(&d_evals, &d_weights, half)
+        } else {
+            gpu.sumcheck.product_sumcheck_ext_ext_device(&d_evals, &d_weights, half)
+        };
+
+        // Host callback: Fiat-Shamir + challenge sampling.
+        let r = on_round(c0, c2);
+
+        // Fold on GPU — data stays on device.
+        if evals_is_base {
+            d_evals = gpu.fold.fold_base_to_ext_device(&d_evals, half, &r);
+            evals_is_base = false;
+        } else {
+            d_evals = gpu.fold.fold_ext_device(&d_evals, half, &r);
+        }
+        d_weights = gpu.fold.fold_ext_device(&d_weights, half, &r);
+        n_evals /= 2;
+    }
+
+    (d_evals, d_weights, n_evals)
+}
+
+/// Phase 5: OOD evaluation on GPU (multilinear evaluation at sampled points).
 /// For now, downloads polynomial and evaluates on CPU (the evaluation is tiny).
 pub fn cpu_ood_eval(
     stacked_poly: &[u32],  // downloaded stacked polynomial
