@@ -473,6 +473,50 @@ extern "C" __global__ void air_sumcheck_execution_kernel(
     }
 }
 
+// ── GKR quotient sum (2-by-2 reduction) ──────────────────────────────────
+// For each pair (i, i+1):
+//   new_num[i/2] = num[i]*den[i+1] + num[i+1]*den[i]
+//   new_den[i/2] = den[i]*den[i+1]
+// Both num and den are ext field elements (5 u32s each).
+extern "C" __global__ void gkr_sum_quotients_kernel(
+    const uint32_t* __restrict__ nums,    // n * 5 ext elements
+    const uint32_t* __restrict__ dens,    // n * 5 ext elements
+    uint32_t* __restrict__ new_nums,       // (n/2) * 5 ext elements
+    uint32_t* __restrict__ new_dens,       // (n/2) * 5 ext elements
+    uint32_t n_pairs                       // n / 2
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_pairs) return;
+
+    uint32_t i0 = 2 * tid;
+    uint32_t i1 = 2 * tid + 1;
+
+    uint32_t num0[5], num1[5], den0[5], den1[5];
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+        num0[k] = nums[i0 * 5 + k];
+        num1[k] = nums[i1 * 5 + k];
+        den0[k] = dens[i0 * 5 + k];
+        den1[k] = dens[i1 * 5 + k];
+    }
+
+    // new_num = num0 * den1 + num1 * den0
+    uint32_t prod0[5], prod1[5], sum_num[5];
+    qe_mul(num0, den1, prod0);
+    qe_mul(num1, den0, prod1);
+    qe_add(prod0, prod1, sum_num);
+
+    // new_den = den0 * den1
+    uint32_t prod_den[5];
+    qe_mul(den0, den1, prod_den);
+
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+        new_nums[tid * 5 + k] = sum_num[k];
+        new_dens[tid * 5 + k] = prod_den[k];
+    }
+}
+
 // ── Split-eq update kernel ───────────────────────────────────────────────
 // After a sumcheck round with challenge r, update the eq factor:
 // For each pair (j, j+stride): eq[j] = eq[j] * (1 - r) + eq[j+stride] * r

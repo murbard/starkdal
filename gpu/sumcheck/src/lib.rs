@@ -32,6 +32,7 @@ pub struct GpuSumcheck {
     fn_eq_accum: cuda_sys::CUfunction,
     fn_eq_accum_offset: cuda_sys::CUfunction,
     fn_air_exec: cuda_sys::CUfunction,
+    fn_gkr_sum: cuda_sys::CUfunction,
 }
 
 unsafe impl Send for GpuSumcheck {}
@@ -68,6 +69,7 @@ impl GpuSumcheck {
             fn_eq_accum: load("eq_accumulate_kernel"),
             fn_eq_accum_offset: load("eq_accumulate_offset_kernel"),
             fn_air_exec: load("air_sumcheck_execution_kernel"),
+            fn_gkr_sum: load("gkr_sum_quotients_kernel"),
         }
     }
 
@@ -554,6 +556,43 @@ impl GpuSumcheck {
         let z0 = self.reduce_partials(&d_z0, blocks);
         let z2 = self.reduce_partials(&d_z2, blocks);
         (z0, z2)
+    }
+
+    /// GKR quotient sum: reduce pairs (num[2i], den[2i]) + (num[2i+1], den[2i+1])
+    /// into (new_num[i], new_den[i]). Device-resident.
+    pub fn gkr_sum_quotients_device(
+        &self,
+        d_nums: &CudaSlice<u32>,
+        d_dens: &CudaSlice<u32>,
+        n_pairs: u32,
+    ) -> (CudaSlice<u32>, CudaSlice<u32>) {
+        let mut d_new_nums = self.stream.alloc_zeros::<u32>((n_pairs as usize) * 5).unwrap();
+        let mut d_new_dens = self.stream.alloc_zeros::<u32>((n_pairs as usize) * 5).unwrap();
+
+        {
+            let (nums_ptr, _g1) = d_nums.device_ptr(&self.stream);
+            let (dens_ptr, _g2) = d_dens.device_ptr(&self.stream);
+            let (nn_ptr, _g3) = d_new_nums.device_ptr_mut(&self.stream);
+            let (nd_ptr, _g4) = d_new_dens.device_ptr_mut(&self.stream);
+
+            let threads = 256u32;
+            let blocks = (n_pairs + threads - 1) / threads;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &nums_ptr as *const _ as *mut _,
+                &dens_ptr as *const _ as *mut _,
+                &nn_ptr as *const _ as *mut _,
+                &nd_ptr as *const _ as *mut _,
+                &n_pairs as *const _ as *mut _,
+            ];
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_gkr_sum, (blocks, 1, 1), (threads, 1, 1),
+                    0, self.stream.cu_stream(), &mut args,
+                ).expect("gkr sum quotients kernel failed");
+            }
+        }
+        self.stream.synchronize().unwrap();
+        (d_new_nums, d_new_dens)
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> { &self.stream }
