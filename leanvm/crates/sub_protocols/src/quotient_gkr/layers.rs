@@ -3,6 +3,58 @@ use std::borrow::Cow;
 
 use backend::*;
 
+#[cfg(feature = "gpu")]
+fn gpu_sum_quotients_2_by_2<EF: ExtensionField<PF<EF>>>(
+    nums: &[EF], dens: &[EF], full_pairs: usize, new_active: usize,
+) -> Option<(Vec<EF>, Vec<EF>)> {
+    use std::sync::OnceLock;
+    static GPU: OnceLock<Option<gpu_sumcheck::GpuSumcheck>> = OnceLock::new();
+    let gpu = GPU.get_or_init(|| {
+        let ctx = cudarc::driver::safe::CudaContext::new(0).ok()?;
+        let stream = ctx.default_stream();
+        Some(gpu_sumcheck::GpuSumcheck::new(stream))
+    }).as_ref()?;
+
+    let dim = EF::DIMENSION; // 5
+    let n = nums.len();
+
+    // Upload nums and dens as flat u32 arrays.
+    let nums_u32: &[u32] = unsafe {
+        std::slice::from_raw_parts(nums.as_ptr().cast::<u32>(), n * dim)
+    };
+    let dens_u32: &[u32] = unsafe {
+        std::slice::from_raw_parts(dens.as_ptr().cast::<u32>(), n * dim)
+    };
+
+    let d_nums = gpu.stream().memcpy_stod(nums_u32).ok()?;
+    let d_dens = gpu.stream().memcpy_stod(dens_u32).ok()?;
+
+    let (d_new_nums, d_new_dens) = gpu.gkr_sum_quotients_device(&d_nums, &d_dens, full_pairs as u32);
+
+    let new_nums_u32 = gpu.stream().memcpy_dtov(&d_new_nums).ok()?;
+    let new_dens_u32 = gpu.stream().memcpy_dtov(&d_new_dens).ok()?;
+
+    // Reconstruct Vec<EF>.
+    let mut new_nums: Vec<EF> = Vec::with_capacity(new_active);
+    let mut new_dens: Vec<EF> = Vec::with_capacity(new_active);
+    for i in 0..full_pairs {
+        new_nums.push(unsafe {
+            std::mem::transmute_copy::<[u32; 5], EF>(&new_nums_u32[i*5..(i+1)*5].try_into().unwrap())
+        });
+        new_dens.push(unsafe {
+            std::mem::transmute_copy::<[u32; 5], EF>(&new_dens_u32[i*5..(i+1)*5].try_into().unwrap())
+        });
+    }
+
+    // Handle boundary element.
+    if full_pairs < new_active {
+        new_nums.push(nums[2 * full_pairs]);
+        new_dens.push(dens[2 * full_pairs]);
+    }
+
+    Some((new_nums, new_dens))
+}
+
 pub(super) enum LayerStorage<'a, EF: ExtensionField<PF<EF>>> {
     Initial {
         nums: Cow<'a, [PFPacking<EF>]>,
@@ -126,6 +178,14 @@ fn sum_quotients_2_by_2<EF: ExtensionField<PF<EF>>>(nums: &[EF], dens: &[EF]) ->
     let active_len = nums.len();
     let new_active = active_len.div_ceil(2);
     let full_pairs = active_len / 2;
+
+    // GPU fast path for large arrays.
+    #[cfg(feature = "gpu")]
+    if full_pairs >= 1024 && std::mem::size_of::<PF<EF>>() == 4 && EF::DIMENSION == 5 {
+        if let Some(result) = gpu_sum_quotients_2_by_2(nums, dens, full_pairs, new_active) {
+            return result;
+        }
+    }
 
     let mut new_nums: Vec<EF> = unsafe { uninitialized_vec(new_active) };
     let mut new_dens: Vec<EF> = unsafe { uninitialized_vec(new_active) };
