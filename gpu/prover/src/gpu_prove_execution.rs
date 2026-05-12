@@ -282,7 +282,98 @@ pub fn gpu_product_sumcheck_rounds(
     (d_evals, d_weights, n_evals)
 }
 
-/// Phase 5: OOD evaluation on GPU (multilinear evaluation at sampled points).
+/// Phase 5: AIR sumcheck for execution table (GPU).
+/// Evaluates constraints across all row pairs, folds, repeats.
+/// Returns the round polynomial coefficients for each round.
+pub fn gpu_air_sumcheck_execution_round(
+    gpu: &GpuProverContext,
+    d_columns: &CudaSlice<u32>,    // 20 columns col-major on device
+    d_down_cols: &CudaSlice<u32>,   // 2 shifted columns col-major on device
+    d_eq_factor: &CudaSlice<u32>,   // eq factor (ext field) on device
+    alphas: &[u32],                  // alpha powers (13 * 5 = 65 u32s)
+    n_rows: u32,
+) -> ([u32; 5], [u32; 5]) {
+    let n_pairs = n_rows / 2;
+    gpu.sumcheck.air_sumcheck_execution_device(
+        d_columns, d_down_cols, d_eq_factor, alphas, n_rows, n_pairs,
+    )
+}
+
+/// The main GPU prove_execution function.
+///
+/// This is a SKELETON that shows the complete protocol flow.
+/// Each step calls our GPU kernels where possible and falls back to CPU
+/// for operations not yet ported (logup GKR, AIR constraint eval for
+/// ExtensionOp and Poseidon16 tables).
+///
+/// The goal is to have ALL heavy compute on GPU, with only Fiat-Shamir
+/// (ProverState) on CPU.
+pub fn gpu_prove_execution_skeleton(
+    gpu: &GpuProverContext,
+    bytecode: &Bytecode,
+    public_input: &[F],
+    witness: &ExecutionWitness,
+    whir_config: &lean_prover::WhirConfigBuilder,
+    vm_profiler: bool,
+) -> Result<ExecutionProof, lean_prover::ProverError> {
+    // === STEP 1: CPU VM execution (cannot be GPU-accelerated) ===
+    let exec_result = lean_vm::try_execute_bytecode(bytecode, public_input, witness, vm_profiler)?;
+    let exec_trace = lean_vm::get_execution_trace(bytecode, exec_result);
+
+    let mut memory = exec_trace.memory;
+    let traces = exec_trace.traces;
+    let metadata = exec_trace.metadata;
+    let public_memory_size = exec_trace.public_memory_size;
+
+    // Pad memory.
+    let min_memory_size = (1 << lean_vm::MIN_LOG_MEMORY_SIZE).max(1 << bytecode.log_size());
+    if memory.len() < min_memory_size {
+        memory.resize(min_memory_size, F::ZERO);
+    }
+
+    // === STEP 2: Upload ALL trace data to GPU (one-time cost) ===
+    let gpu_trace = GpuTrace::upload(&gpu.stream, &traces, &memory, public_memory_size);
+
+    // === STEP 3: Access counts on GPU ===
+    // TODO: use gpu_trace_ops::access_count for memory and bytecode
+    // For now, compute on CPU and upload.
+    let mut memory_acc = F::zero_vec(memory.len());
+    for (table, trace) in &traces {
+        for lookup in table.lookups() {
+            for i in &trace.columns[lookup.index] {
+                for j in 0..lookup.values.len() {
+                    memory_acc[i.to_usize() + j] += F::ONE;
+                }
+            }
+        }
+    }
+    let mut bytecode_acc = F::zero_vec(bytecode.padded_size());
+    for pc in traces[&Table::execution()].columns[lean_vm::tables::execution::air::COL_PC].iter() {
+        bytecode_acc[pc.to_usize()] += F::ONE;
+    }
+
+    let mem_acc_u32 = unsafe { std::slice::from_raw_parts(memory_acc.as_ptr().cast::<u32>(), memory_acc.len()) };
+    let bc_acc_u32 = unsafe { std::slice::from_raw_parts(bytecode_acc.as_ptr().cast::<u32>(), bytecode_acc.len()) };
+    let d_memory_acc = gpu.stream.memcpy_stod(mem_acc_u32).unwrap();
+    let d_bytecode_acc = gpu.stream.memcpy_stod(bc_acc_u32).unwrap();
+
+    // === STEP 4: Polynomial stacking + WHIR commit ===
+    let (_d_stacked, stacked_n_vars) = gpu_stack_polynomial(
+        gpu, &gpu_trace, &d_memory_acc, &d_bytecode_acc, bytecode.log_size(),
+    );
+
+    // === For the remaining steps (logup, AIR sumcheck, WHIR prove),
+    // we currently fall back to the CPU prove_execution. ===
+    // The full GPU implementation will replace this with GPU kernel calls.
+
+    // For now, call the CPU prover to produce a valid proof.
+    // This ensures correctness while we incrementally replace each step.
+    lean_prover::prove_execution::prove_execution(
+        bytecode, public_input, witness, whir_config, vm_profiler,
+    )
+}
+
+/// Phase 6: OOD evaluation on GPU (multilinear evaluation at sampled points).
 /// For now, downloads polynomial and evaluates on CPU (the evaluation is tiny).
 pub fn cpu_ood_eval(
     stacked_poly: &[u32],  // downloaded stacked polynomial
