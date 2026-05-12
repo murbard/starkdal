@@ -17,4 +17,4 @@ koala-bear = { path = "koala-bear", package = "mt-koala-bear" }
 utils = { path = "utils", package = "mt-utils" }
 
 [features]
-gpu = ["whir/gpu"]
+gpu = ["whir/gpu", "fiat-shamir/gpu"]

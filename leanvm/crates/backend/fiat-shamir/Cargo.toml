@@ -11,3 +11,8 @@ utils = { path = "../utils", package = "mt-utils" }
 tracing.workspace = true
 serde.workspace = true
 rayon.workspace = true
+
+gpu-pow-grind = { path = "../../../../gpu/pow_grind", optional = true }
+
+[features]
+gpu = ["dep:gpu-pow-grind"]

@@ -122,6 +122,26 @@ where
 
         let time = Instant::now();
 
+        // GPU fast path for PoW grinding.
+        #[cfg(feature = "gpu")]
+        if std::mem::size_of::<PF<EF>>() == 4 {
+            let mut state_u32 = [0u32; 16];
+            for (i, s) in self.challenger.state.iter().enumerate() {
+                state_u32[i] = unsafe { *(s as *const PF<EF> as *const u32) };
+            }
+            if let Some(nonce) = gpu_pow_grind::GpuPowGrinder::grind_static(
+                &state_u32, RATE as u32, bits as u32, 1 << 28,
+            ) {
+                let witness: PF<EF> = unsafe { *(&nonce as *const u32 as *const PF<EF>) };
+                self.challenger.observe_scalars(&[witness]);
+                assert!(self.challenger.state[0].as_canonical_u64() & ((1 << bits) - 1) == 0);
+                self.transcript.push(witness);
+                let elapsed = time.elapsed();
+                POW_GRINDING_NANOS.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+                return;
+            }
+        }
+
         type Packed<EF> = <PF<EF> as Field>::Packing;
         let lanes = Packed::<EF>::WIDTH;
 
