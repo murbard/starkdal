@@ -135,6 +135,98 @@ where
     Some((sumcheck, MultilinearPoint(challenges)))
 }
 
+/// GPU initial sumcheck with DEVICE-RESIDENT weights (from gpu_combine_statement).
+/// Only evals need to be uploaded (~128MB). Weights are already on GPU (~640MB saved!).
+#[instrument(name = "GPU initial sumcheck (device weights)", skip_all)]
+pub(crate) fn gpu_initial_sumcheck_with_device_weights<EF>(
+    base_evals: &[PF<EF>],
+    d_weights: cudarc::driver::safe::CudaSlice<u32>,
+    sum: EF,
+    prover_state: &mut impl FSProver<EF>,
+    folding_factor: usize,
+    pow_bits: usize,
+    num_variables: usize,
+) -> Option<(SumcheckSingle<EF>, MultilinearPoint<EF>)>
+where
+    EF: ExtensionField<PF<EF>>,
+{
+    let g = gpu_backend::gpu()?;
+    let dim = EF::DIMENSION;
+    let n_evals = base_evals.len();
+    let pf_width = packing_width::<EF>();
+
+    let evals_u32: &[u32] = unsafe {
+        std::slice::from_raw_parts(base_evals.as_ptr().cast::<u32>(), n_evals)
+    };
+
+    tracing::info!(
+        "GPU initial sumcheck (device weights): n={n_evals}, upload_evals={:.1}MB, weights already on GPU",
+        (n_evals * 4) as f64 / 1e6,
+    );
+
+    // Upload ONLY evals (weights are already on GPU!).
+    let mut d_evals = g.stream.memcpy_stod(evals_u32).ok()?;
+    let mut d_weights = d_weights; // already on device
+
+    let mut current_sum = sum;
+    let mut challenges = Vec::with_capacity(folding_factor);
+    let mut evals_is_base = true;
+    let mut n_elements = n_evals;
+
+    for _round in 0..folding_factor {
+        let half = (n_elements / 2) as u32;
+
+        let (c0_u32, c2_u32) = if evals_is_base {
+            g.sumcheck.product_sumcheck_base_ext_device(&d_evals, &d_weights, half)
+        } else {
+            g.sumcheck.product_sumcheck_ext_ext_device(&d_evals, &d_weights, half)
+        };
+
+        let c0 = ef_from_u32::<EF>(&c0_u32);
+        let c2 = ef_from_u32::<EF>(&c2_u32);
+        let c1 = current_sum - c0.double() - c2;
+        let poly = DensePolynomial::new(vec![c0, c1, c2]);
+
+        prover_state.add_sumcheck_polynomial(&poly.coeffs, None);
+        prover_state.pow_grinding(pow_bits);
+        let r: EF = prover_state.sample();
+        current_sum = poly.evaluate(r);
+        let r_u32 = ef_to_u32::<EF>(&r);
+        challenges.push(r);
+
+        if evals_is_base {
+            d_evals = g.fold.fold_base_to_ext_device(&d_evals, half, &r_u32);
+            evals_is_base = false;
+        } else {
+            d_evals = g.fold.fold_ext_device(&d_evals, half, &r_u32);
+        }
+        d_weights = g.fold.fold_ext_device(&d_weights, half, &r_u32);
+        n_elements /= 2;
+    }
+
+    let current_evals = g.stream.memcpy_dtov(&d_evals).ok()?;
+    let current_weights = g.stream.memcpy_dtov(&d_weights).ok()?;
+
+    let n_final_ext = current_evals.len() / dim;
+    let n_packed_final = n_final_ext / pf_width;
+    assert_eq!(n_packed_final * pf_width, n_final_ext);
+
+    let evals_packed_out = repack_to_extension_packed::<EF>(
+        &current_evals, n_packed_final, dim, pf_width,
+    );
+    let weights_packed_out = repack_to_extension_packed::<EF>(
+        &current_weights, n_packed_final, dim, pf_width,
+    );
+
+    let sumcheck = SumcheckSingle {
+        evals: MleOwned::ExtensionPacked(evals_packed_out),
+        weights: MleOwned::ExtensionPacked(weights_packed_out),
+        sum: current_sum,
+    };
+
+    Some((sumcheck, MultilinearPoint(challenges)))
+}
+
 /// Repack flat u32 array to Vec<EFPacking<EF>>.
 fn repack_to_extension_packed<EF: ExtensionField<PF<EF>>>(
     flat: &[u32],

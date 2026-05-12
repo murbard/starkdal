@@ -30,6 +30,7 @@ pub struct GpuSumcheck {
     fn_transpose: cuda_sys::CUfunction,
     fn_eq_expand: cuda_sys::CUfunction,
     fn_eq_accum: cuda_sys::CUfunction,
+    fn_eq_accum_offset: cuda_sys::CUfunction,
 }
 
 unsafe impl Send for GpuSumcheck {}
@@ -64,6 +65,7 @@ impl GpuSumcheck {
             fn_transpose: load("transpose_packed_ext_kernel"),
             fn_eq_expand: load("eq_expand_step_kernel"),
             fn_eq_accum: load("eq_accumulate_kernel"),
+            fn_eq_accum_offset: load("eq_accumulate_offset_kernel"),
         }
     }
 
@@ -458,6 +460,40 @@ impl GpuSumcheck {
                     self.fn_eq_accum, (blocks, 1, 1), (threads, 1, 1),
                     0, self.stream.cu_stream(), &mut args,
                 ).expect("eq accumulate kernel failed");
+            }
+        }
+        self.stream.synchronize().unwrap();
+    }
+
+    /// Accumulate with offset: weights[offset + j] += scalar * eq_val[j]. In-place on device.
+    pub fn eq_accumulate_offset_device(
+        &self,
+        d_weights: &mut CudaSlice<u32>,
+        d_eq_val: &CudaSlice<u32>,
+        scalar: &[u32; 5],
+        offset: u32,
+        n: u32,
+    ) {
+        let d_scalar = self.stream.memcpy_stod(scalar.as_slice()).unwrap();
+        {
+            let (w_ptr, _g1) = d_weights.device_ptr_mut(&self.stream);
+            let (eq_ptr, _g2) = d_eq_val.device_ptr(&self.stream);
+            let (s_ptr, _g3) = d_scalar.device_ptr(&self.stream);
+
+            let threads = 256u32;
+            let blocks = (n + threads - 1) / threads;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &w_ptr as *const _ as *mut _,
+                &eq_ptr as *const _ as *mut _,
+                &s_ptr as *const _ as *mut _,
+                &offset as *const _ as *mut _,
+                &n as *const _ as *mut _,
+            ];
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_eq_accum_offset, (blocks, 1, 1), (threads, 1, 1),
+                    0, self.stream.cu_stream(), &mut args,
+                ).expect("eq accumulate offset kernel failed");
             }
         }
         self.stream.synchronize().unwrap();

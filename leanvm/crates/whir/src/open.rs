@@ -418,8 +418,26 @@ where
     ) -> (Self, MultilinearPoint<EF>) {
         assert_ne!(folding_factor, 0);
 
-        let (weights_packed, sum) = combine_statement::<EF>(statement, combination_randomness);
+        // GPU fast path: build weights on GPU (no upload!) + device-resident product sumcheck.
+        #[cfg(feature = "gpu")]
+        if let MleRef::Base(base_evals) = evals {
+            if std::mem::size_of::<PF<EF>>() == 4 && EF::DIMENSION == 5 {
+                let num_variables = statement[0].total_num_variables;
+                if let Some((d_weights, sum)) = crate::gpu_combine::gpu_combine_statement(
+                    &statement, combination_randomness, num_variables,
+                ) {
+                    if let Some(result) = crate::gpu_prove::gpu_initial_sumcheck_with_device_weights::<EF>(
+                        base_evals, d_weights, sum, prover_state, folding_factor, pow_bits, num_variables,
+                    ) {
+                        return result;
+                    }
+                }
+            }
+        }
 
+        let (weights_packed, sum) = info_span!("combine_statement").in_scope(||
+            combine_statement::<EF>(statement, combination_randomness)
+        );
         let mut evals = evals.pack();
         let mut weights = Mle::Owned(MleOwned::ExtensionPacked(weights_packed));
         let (challengess, new_sum, new_evals, new_weights) = run_product_sumcheck(

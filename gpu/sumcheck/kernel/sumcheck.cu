@@ -324,6 +324,34 @@ extern "C" __global__ void eq_accumulate_kernel(
         weights[j * 5 + i] = kb_add(weights[j * 5 + i], prod[i]);
 }
 
+// Accumulate with offset: weights[offset + j] += scalar * eq_val[j].
+extern "C" __global__ void eq_accumulate_offset_kernel(
+    uint32_t* __restrict__ weights,       // total_n * 5 ext, modified in place
+    const uint32_t* __restrict__ eq_val,  // n * 5 ext
+    const uint32_t* __restrict__ scalar,  // 5 ext
+    uint32_t offset,                       // element offset into weights
+    uint32_t n
+) {
+    uint32_t j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (j >= n) return;
+
+    uint32_t s[5];
+    #pragma unroll
+    for (int i = 0; i < 5; i++) s[i] = scalar[i];
+
+    uint32_t eq[5];
+    #pragma unroll
+    for (int i = 0; i < 5; i++) eq[i] = eq_val[j * 5 + i];
+
+    uint32_t prod[5];
+    qe_mul(s, eq, prod);
+
+    uint32_t dst = (offset + j) * 5;
+    #pragma unroll
+    for (int i = 0; i < 5; i++)
+        weights[dst + i] = kb_add(weights[dst + i], prod[i]);
+}
+
 // ── Split-eq update kernel ───────────────────────────────────────────────
 // After a sumcheck round with challenge r, update the eq factor:
 // For each pair (j, j+stride): eq[j] = eq[j] * (1 - r) + eq[j+stride] * r

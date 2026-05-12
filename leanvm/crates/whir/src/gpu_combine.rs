@@ -9,6 +9,7 @@ use cudarc::driver::safe::CudaSlice;
 
 use crate::SparseStatement;
 use crate::gpu_backend;
+use poly::matrix_next_mle_folded;
 
 /// Build combined weights on GPU.
 ///
@@ -40,25 +41,31 @@ where
     let mut gamma_pow = EF::ONE;
 
     for smt in statements {
-        // Only handle the simple case: single point evaluation with dense eq.
-        // Complex cases (is_next, sparse selectors) fall back to CPU.
-        if smt.is_next {
-            return None; // Can't handle "next" MLE on GPU yet.
-        }
+        let inner_n_vars = smt.inner_num_variables();
+        let inner_n = 1usize << inner_n_vars;
 
-        let point_ef_u32: Vec<[u32; 5]> = smt.point.0.iter().map(|p| {
-            let mut out = [0u32; 5];
-            let coeffs = p.as_basis_coefficients_slice();
-            for (j, c) in coeffs.iter().enumerate() {
-                out[j] = unsafe { *(c as *const PF<EF> as *const u32) };
-            }
-            out
-        }).collect();
+        // Build the polynomial on GPU (eq or next_mle depending on is_next).
+        let d_poly = if smt.is_next {
+            // next_mle: compute on CPU, upload to GPU (small: ~few KB per statement).
+            let next_values = matrix_next_mle_folded::<EF>(&smt.point.0);
+            let next_u32: &[u32] = unsafe {
+                std::slice::from_raw_parts(next_values.as_ptr().cast::<u32>(), next_values.len() * dim)
+            };
+            g.stream.memcpy_stod(next_u32).ok()?
+        } else {
+            // eq polynomial: build on GPU.
+            let point_ef_u32: Vec<[u32; 5]> = smt.point.0.iter().map(|p| {
+                let mut out = [0u32; 5];
+                let coeffs = p.as_basis_coefficients_slice();
+                for (j, c) in coeffs.iter().enumerate() {
+                    out[j] = unsafe { *(c as *const PF<EF> as *const u32) };
+                }
+                out
+            }).collect();
+            g.sumcheck.eq_polynomial_device(&point_ef_u32)
+        };
 
         for evaluation in &smt.values {
-            // Build eq(point, x) on GPU for the inner variables.
-            let inner_n_vars = smt.inner_num_variables();
-            let d_eq = g.sumcheck.eq_polynomial_device(&point_ef_u32);
 
             // Scale by gamma_pow and accumulate into weights at the selector offset.
             let scalar_u32 = {
@@ -74,18 +81,24 @@ where
             let inner_n = 1usize << inner_n_vars;
 
             if selector == 0 && inner_n == n_total {
-                // Dense case: eq covers the full domain. Accumulate directly.
+                // Dense case: polynomial covers the full domain. Accumulate directly.
                 g.sumcheck.eq_accumulate_device(
                     &mut d_weights,
-                    &d_eq,
+                    &d_poly,
                     &scalar_u32,
                     n_total as u32,
                 );
             } else {
                 // Sparse case: eq covers a sub-range at selector offset.
-                // For now, download eq, scatter on CPU, re-upload.
-                // This is the fallback for complex selector patterns.
-                return None; // Fall back to CPU for sparse selectors.
+                // Use offset accumulator: weights[selector * inner_n + j] += scalar * eq[j]
+                let offset = (selector * inner_n) as u32;
+                g.sumcheck.eq_accumulate_offset_device(
+                    &mut d_weights,
+                    &d_poly,
+                    &scalar_u32,
+                    offset,
+                    inner_n as u32,
+                );
             }
 
             combined_sum += evaluation.value * gamma_pow;
