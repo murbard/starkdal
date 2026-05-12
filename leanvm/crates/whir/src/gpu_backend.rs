@@ -7,6 +7,8 @@ use symetric::DIGEST_ELEMS;
 pub(crate) struct GpuBackend {
     pub merkle: gpu_merkle::GpuMerkle,
     pub ntt: gpu_ntt::GpuNtt,
+    pub sumcheck: gpu_sumcheck::GpuSumcheck,
+    pub fold: gpu_poly_fold::GpuPolyFold,
     pub stream: Arc<CudaStream>,
 }
 
@@ -21,6 +23,8 @@ pub(crate) fn gpu() -> Option<&'static GpuBackend> {
                 Some(GpuBackend {
                     merkle: gpu_merkle::GpuMerkle::new(stream.clone()),
                     ntt: gpu_ntt::GpuNtt::new(stream.clone()),
+                    sumcheck: gpu_sumcheck::GpuSumcheck::new(stream.clone()),
+                    fold: gpu_poly_fold::GpuPolyFold::new(stream.clone()),
                     stream,
                 })
             }
