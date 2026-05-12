@@ -352,6 +352,127 @@ extern "C" __global__ void eq_accumulate_offset_kernel(
         weights[dst + i] = kb_add(weights[dst + i], prod[i]);
 }
 
+// ── AIR constraint evaluation kernel ─────────────────────────────────────
+// For each row pair (i0, i1), evaluates constraints at z=0 and z=2,
+// multiplied by alpha powers, accumulated into partial sums.
+// This handles the Execution table (13 constraints, 20 up + 2 down columns).
+//
+// For each pair:
+//   point[k] = col[i0][k]  (column value at lower row)
+//   diff[k] = col[i1][k] - col[i0][k]
+//   At z=0: eval constraints with point values
+//   At z=2: eval constraints with (point + 2*diff) values
+//   result[z] += sum(alpha[c] * constraint[c]) * eq_factor
+//
+// partial_sums: n_blocks * (degree+1) * 5 ext field elements.
+#include "air_constraints.cuh"
+
+extern "C" __global__ void air_sumcheck_execution_kernel(
+    const uint32_t* __restrict__ columns,   // n_cols * n_rows base elements (col-major)
+    const uint32_t* __restrict__ down_cols,  // 2 * n_rows base elements (col-major)
+    const uint32_t* __restrict__ eq_factor,  // n_pairs * 5 ext elements
+    const uint32_t* __restrict__ alphas,     // 13 * 5 ext elements (alpha powers)
+    uint32_t* __restrict__ partial_z0,       // n_blocks * 5 ext
+    uint32_t* __restrict__ partial_z2,       // n_blocks * 5 ext
+    uint32_t n_rows,
+    uint32_t n_pairs                         // n_rows / 2
+) {
+    extern __shared__ uint32_t smem[];
+    uint32_t tid = threadIdx.x;
+    uint32_t gid = blockIdx.x * blockDim.x + tid;
+
+    uint32_t z0_acc[5] = {0,0,0,0,0};
+    uint32_t z2_acc[5] = {0,0,0,0,0};
+
+    if (gid < n_pairs) {
+        uint32_t i0 = gid;
+        uint32_t i1 = gid + n_pairs;
+
+        // Load column values at (i0, i1).
+        uint32_t up_0[20], up_2[20];
+        uint32_t down_0[2], down_2[2];
+
+        for (int c = 0; c < 20; c++) {
+            uint32_t v0 = columns[c * n_rows + i0];
+            uint32_t v1 = columns[c * n_rows + i1];
+            up_0[c] = v0;
+            // z=2: point + 2*diff = point + 2*(v1-v0) = 2*v1 - v0
+            up_2[c] = kb_sub(kb_double(v1), v0);
+        }
+        for (int c = 0; c < 2; c++) {
+            uint32_t v0 = down_cols[c * n_rows + i0];
+            uint32_t v1 = down_cols[c * n_rows + i1];
+            down_0[c] = v0;
+            down_2[c] = kb_sub(kb_double(v1), v0);
+        }
+
+        // Evaluate constraints at z=0 and z=2.
+        uint32_t c0[13], c2[13];
+        eval_execution_air(up_0, down_0, c0);
+        eval_execution_air(up_2, down_2, c2);
+
+        // Accumulate: z_acc += sum(alphas[c] * constraints[c]) * eq_factor[pair]
+        uint32_t eq[5];
+        for (int k = 0; k < 5; k++) eq[k] = eq_factor[gid * 5 + k];
+
+        uint32_t weighted_z0[5] = {0,0,0,0,0};
+        uint32_t weighted_z2[5] = {0,0,0,0,0};
+        for (int c = 0; c < 13; c++) {
+            // alpha[c] is ext field, constraint is base field.
+            // Product: alpha[c] * constraint[c] (base × ext = ext)
+            for (int k = 0; k < 5; k++) {
+                uint32_t a = alphas[c * 5 + k];
+                weighted_z0[k] = kb_add(weighted_z0[k], kb_mul(a, c0[c]));
+                weighted_z2[k] = kb_add(weighted_z2[k], kb_mul(a, c2[c]));
+            }
+        }
+
+        // Multiply by eq factor (ext × ext = ext).
+        uint32_t prod_z0[5], prod_z2[5];
+        qe_mul(weighted_z0, eq, prod_z0);
+        qe_mul(weighted_z2, eq, prod_z2);
+
+        for (int k = 0; k < 5; k++) {
+            z0_acc[k] = prod_z0[k];
+            z2_acc[k] = prod_z2[k];
+        }
+    }
+
+    // Warp-level reduction.
+    warp_reduce_add_ext(z0_acc);
+    warp_reduce_add_ext(z2_acc);
+
+    uint32_t warp_id = tid / 32;
+    uint32_t lane = tid % 32;
+    if (lane == 0) {
+        for (int k = 0; k < 5; k++) {
+            smem[warp_id * 5 + k] = z0_acc[k];
+            smem[(blockDim.x / 32 + warp_id) * 5 + k] = z2_acc[k];
+        }
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        uint32_t n_warps = blockDim.x / 32;
+        uint32_t final_z0[5] = {0,0,0,0,0};
+        uint32_t final_z2[5] = {0,0,0,0,0};
+        for (uint32_t w = tid; w < n_warps; w += 32) {
+            for (int k = 0; k < 5; k++) {
+                final_z0[k] = kb_add(final_z0[k], smem[w * 5 + k]);
+                final_z2[k] = kb_add(final_z2[k], smem[(n_warps + w) * 5 + k]);
+            }
+        }
+        warp_reduce_add_ext(final_z0);
+        warp_reduce_add_ext(final_z2);
+        if (tid == 0) {
+            for (int k = 0; k < 5; k++) {
+                partial_z0[blockIdx.x * 5 + k] = final_z0[k];
+                partial_z2[blockIdx.x * 5 + k] = final_z2[k];
+            }
+        }
+    }
+}
+
 // ── Split-eq update kernel ───────────────────────────────────────────────
 // After a sumcheck round with challenge r, update the eq factor:
 // For each pair (j, j+stride): eq[j] = eq[j] * (1 - r) + eq[j+stride] * r

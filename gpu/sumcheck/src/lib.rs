@@ -31,6 +31,7 @@ pub struct GpuSumcheck {
     fn_eq_expand: cuda_sys::CUfunction,
     fn_eq_accum: cuda_sys::CUfunction,
     fn_eq_accum_offset: cuda_sys::CUfunction,
+    fn_air_exec: cuda_sys::CUfunction,
 }
 
 unsafe impl Send for GpuSumcheck {}
@@ -66,6 +67,7 @@ impl GpuSumcheck {
             fn_eq_expand: load("eq_expand_step_kernel"),
             fn_eq_accum: load("eq_accumulate_kernel"),
             fn_eq_accum_offset: load("eq_accumulate_offset_kernel"),
+            fn_air_exec: load("air_sumcheck_execution_kernel"),
         }
     }
 
@@ -497,6 +499,61 @@ impl GpuSumcheck {
             }
         }
         self.stream.synchronize().unwrap();
+    }
+
+    /// AIR sumcheck for execution table: evaluate 13 constraints across all row pairs.
+    /// Returns (z0_sum, z2_sum) as ext field elements (each 5 u32s).
+    ///
+    /// columns: 20 columns in col-major order (20 * n_rows base elements on device).
+    /// down_cols: 2 shifted columns in col-major order (2 * n_rows base elements on device).
+    /// eq_factor: n_pairs ext field elements (n_pairs * 5 on device).
+    /// alphas: 13 ext field alpha powers (13 * 5 u32s on host).
+    pub fn air_sumcheck_execution_device(
+        &self,
+        d_columns: &CudaSlice<u32>,
+        d_down_cols: &CudaSlice<u32>,
+        d_eq_factor: &CudaSlice<u32>,
+        alphas: &[u32],  // 13 * 5 = 65 u32s
+        n_rows: u32,
+        n_pairs: u32,
+    ) -> ([u32; 5], [u32; 5]) {
+        let d_alphas = self.stream.memcpy_stod(alphas).unwrap();
+        let threads = 256u32;
+        let blocks = (n_pairs + threads - 1) / threads;
+        let smem = (threads / 32 * 2 * 5 * 4) as u32;
+
+        let mut d_z0 = self.stream.alloc_zeros::<u32>((blocks as usize) * 5).unwrap();
+        let mut d_z2 = self.stream.alloc_zeros::<u32>((blocks as usize) * 5).unwrap();
+
+        {
+            let (col_ptr, _g1) = d_columns.device_ptr(&self.stream);
+            let (down_ptr, _g2) = d_down_cols.device_ptr(&self.stream);
+            let (eq_ptr, _g3) = d_eq_factor.device_ptr(&self.stream);
+            let (alpha_ptr, _g4) = d_alphas.device_ptr(&self.stream);
+            let (z0_ptr, _g5) = d_z0.device_ptr_mut(&self.stream);
+            let (z2_ptr, _g6) = d_z2.device_ptr_mut(&self.stream);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &col_ptr as *const _ as *mut _,
+                &down_ptr as *const _ as *mut _,
+                &eq_ptr as *const _ as *mut _,
+                &alpha_ptr as *const _ as *mut _,
+                &z0_ptr as *const _ as *mut _,
+                &z2_ptr as *const _ as *mut _,
+                &n_rows as *const _ as *mut _,
+                &n_pairs as *const _ as *mut _,
+            ];
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_air_exec, (blocks, 1, 1), (threads, 1, 1),
+                    smem, self.stream.cu_stream(), &mut args,
+                ).expect("air sumcheck execution kernel failed");
+            }
+        }
+        self.stream.synchronize().unwrap();
+
+        let z0 = self.reduce_partials(&d_z0, blocks);
+        let z2 = self.reduce_partials(&d_z2, blocks);
+        (z0, z2)
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> { &self.stream }
