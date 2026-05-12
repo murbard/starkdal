@@ -13,6 +13,8 @@ pub mod gpu_whir;
 pub mod gpu_product_sumcheck;
 pub mod gpu_prove_execution;
 pub mod gpu_prover;
+pub mod gpu_whir_protocol;
+pub mod gpu_orchestrate;
 
 use std::sync::Arc;
 
