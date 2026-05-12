@@ -72,27 +72,52 @@ where
         let effective_n_cols = actual_data_len.div_ceil(evals_len / n_blocks);
         let dft_n_cols = effective_n_cols.next_multiple_of(packing_width::<EF>()).min(n_blocks);
 
-        // CPU DFT + GPU Merkle (best combo: CPU DFT is fast, GPU Merkle saves 300ms).
-        // The GPU DFT chain was slower due to upload overhead at 2^24 scale.
+        // GPU fast path: reorder → DFT → Merkle (chained on device).
+        #[cfg(feature = "gpu")]
+        if let MleOwned::Base(base_evals) = polynomial {
+            if std::mem::size_of::<PF<EF>>() == 4
+                && std::any::TypeId::of::<PF<EF>>() == std::any::TypeId::of::<koala_bear::KoalaBear>()
+            {
+                let kb_evals: &[koala_bear::KoalaBear] = unsafe {
+                    std::slice::from_raw_parts(base_evals.as_ptr().cast(), base_evals.len())
+                };
+                if let Some((digest_layers, dft_kb)) = crate::gpu_backend::gpu_reorder_dft_merkle(
+                    kb_evals, base_evals.len(), self.folding_factor.at_round(0),
+                    self.starting_log_inv_rate, n_blocks,
+                ) {
+                    let dft_pf: Vec<PF<EF>> = unsafe { std::mem::transmute(dft_kb) };
+                    let digest_layers_pf: Vec<Vec<[PF<EF>; DIGEST_ELEMS]>> = unsafe {
+                        std::mem::transmute(digest_layers)
+                    };
+                    let dft_matrix: DenseMatrix<PF<EF>> = DenseMatrix::new(dft_pf, n_blocks);
+                    let tree = symetric::merkle::MerkleTree { digest_layers: digest_layers_pf };
+                    let whir_tree: RoundMerkleTree<PF<EF>> = WhirMerkleTree {
+                        leaf: dft_matrix, tree, full_leaf_base_width: n_blocks,
+                    };
+                    let root = whir_tree.root();
+                    let prover_data = MerkleData::Base(whir_tree);
+
+                    prover_state.add_base_scalars(&root);
+                    let (ood_points, ood_answers) = sample_ood_points::<EF, _>(
+                        prover_state, self.commitment_ood_samples, self.num_variables,
+                        |point| polynomial.evaluate(point),
+                    );
+                    return Witness { prover_data, ood_points, ood_answers };
+                }
+            }
+        }
+
+        // CPU fallback.
         let folded_matrix = info_span!("FFT").in_scope(|| {
-            reorder_and_dft(
-                &polynomial.by_ref(),
-                self.folding_factor.at_round(0),
-                self.starting_log_inv_rate,
-                dft_n_cols,
-            )
+            reorder_and_dft(&polynomial.by_ref(), self.folding_factor.at_round(0),
+                self.starting_log_inv_rate, dft_n_cols)
         });
-        // MerkleData::build calls build_merkle_tree_koalabear which is
-        // GPU-accelerated when the `gpu` feature is enabled.
         let (prover_data, root) = MerkleData::build(folded_matrix, n_blocks, effective_n_cols);
-
         prover_state.add_base_scalars(&root);
-
-        let (ood_points, ood_answers) =
-            sample_ood_points::<EF, _>(prover_state, self.commitment_ood_samples, self.num_variables, |point| {
-                polynomial.evaluate(point)
-            });
-
+        let (ood_points, ood_answers) = sample_ood_points::<EF, _>(
+            prover_state, self.commitment_ood_samples, self.num_variables,
+            |point| polynomial.evaluate(point),
+        );
         Witness { prover_data, ood_points, ood_answers }
     }
 }
