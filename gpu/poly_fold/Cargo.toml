@@ -1,0 +1,16 @@
+[package]
+name = "gpu-poly-fold"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cudarc = { version = "0.16", features = ["cuda-12060"] }
+koala-bear = { path = "../../leanvm/crates/backend/koala-bear", package = "mt-koala-bear" }
+field = { path = "../../leanvm/crates/backend/field", package = "mt-field" }
+rand = "0.10"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = "1"

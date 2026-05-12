@@ -1,0 +1,28 @@
+[package]
+name = "gpu-prover"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# GPU modules
+cudarc = { version = "0.16", features = ["cuda-12060"] }
+gpu-poseidon16 = { path = "../poseidon16" }
+gpu-pow-grind = { path = "../pow_grind" }
+gpu-ntt = { path = "../ntt" }
+gpu-merkle = { path = "../merkle" }
+gpu-sumcheck = { path = "../sumcheck" }
+gpu-poly-fold = { path = "../poly_fold" }
+gpu-trace-ops = { path = "../trace_ops" }
+gpu-logup = { path = "../logup" }
+
+# leanVM (for types, VM execution, Fiat-Shamir)
+backend = { path = "../../leanvm/crates/backend" }
+field = { path = "../../leanvm/crates/backend/field", package = "mt-field" }
+lean_vm = { path = "../../leanvm/crates/lean_vm" }
+lean_prover = { path = "../../leanvm/crates/lean_prover" }
+lean_compiler = { path = "../../leanvm/crates/lean_compiler" }
+utils = { path = "../../leanvm/crates/utils" }
+sub_protocols = { path = "../../leanvm/crates/sub_protocols" }
+
+rand = "0.10"
+clap = { version = "4", features = ["derive"] }

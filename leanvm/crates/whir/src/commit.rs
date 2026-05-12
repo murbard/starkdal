@@ -65,12 +65,11 @@ where
         &self,
         prover_state: &mut impl FSProver<EF>,
         polynomial: &MleOwned<EF>,
-        actual_data_len: usize, // polynomial[actual_data_len..] is zero
+        actual_data_len: usize,
     ) -> Witness<EF> {
         let n_blocks = 1usize << self.folding_factor.at_round(0);
         let evals_len = 1usize << self.num_variables;
         let effective_n_cols = actual_data_len.div_ceil(evals_len / n_blocks);
-        // DFT matrix width: skip as many zero columns as possible, aligned to packing (SIMD)
         let dft_n_cols = effective_n_cols.next_multiple_of(packing_width::<EF>()).min(n_blocks);
 
         let folded_matrix = info_span!("FFT").in_scope(|| {
@@ -82,6 +81,8 @@ where
             )
         });
 
+        // MerkleData::build calls build_merkle_tree_koalabear which is GPU-accelerated
+        // when the `gpu` feature is enabled (via gpu_backend::gpu_build_merkle_digests).
         let (prover_data, root) = MerkleData::build(folded_matrix, n_blocks, effective_n_cols);
 
         prover_state.add_base_scalars(&root);

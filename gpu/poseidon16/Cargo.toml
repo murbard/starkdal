@@ -1,0 +1,22 @@
+[package]
+name = "gpu-poseidon16"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# CUDA runtime bindings
+cudarc = { version = "0.16", features = ["cuda-12060"] }
+
+# Reference implementation (for constant extraction + property tests)
+koala-bear = { path = "../../leanvm/crates/backend/koala-bear", package = "mt-koala-bear" }
+field = { path = "../../leanvm/crates/backend/field", package = "mt-field" }
+
+# CLI + RNG
+clap = { version = "4", features = ["derive"] }
+rand = "0.10"
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+proptest = "1"

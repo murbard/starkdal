@@ -61,6 +61,18 @@ fn build_merkle_tree_koalabear(
     full_base_width: usize,
     effective_base_width: usize,
 ) -> RoundMerkleTree<KoalaBear> {
+    // GPU fast path: compute leaf digests on GPU, then use CPU's from_first_layer
+    // for binary reduction (ensures correct layer padding for Merkle path opening).
+    #[cfg(feature = "gpu")]
+    if let Some(gpu_digest_layers) = crate::gpu_backend::gpu_build_merkle_digests(
+        &leaf.values, leaf.height(), full_base_width, leaf.width(),
+    ) {
+        let first_layer = gpu_digest_layers.into_iter().next().unwrap();
+        let perm = default_koalabear_poseidon1_16();
+        let tree = symetric::merkle::MerkleTree::from_first_layer::<PFPacking<KoalaBear>, _, 16>(&perm, first_layer);
+        return WhirMerkleTree { leaf, tree, full_leaf_base_width: full_base_width };
+    }
+
     let perm = default_koalabear_poseidon1_16();
     let n_zero_suffix_rate_chunks = (full_base_width - effective_base_width) / 8;
     let first_layer = if n_zero_suffix_rate_chunks >= 2 {
@@ -156,7 +168,7 @@ pub(crate) fn merkle_verify<F: Field, EF: ExtensionField<F>>(
 pub struct WhirMerkleTree<F, M, const DIGEST_ELEMS: usize> {
     pub(crate) leaf: M,
     pub(crate) tree: symetric::merkle::MerkleTree<F, DIGEST_ELEMS>,
-    full_leaf_base_width: usize,
+    pub(crate) full_leaf_base_width: usize,
 }
 
 impl<F: Clone + Copy + Default + Send + Sync, M: Matrix<F>, const DIGEST_ELEMS: usize>
