@@ -31,6 +31,8 @@ pub(crate) use matrix::*;
 pub(crate) mod gpu_backend;
 #[cfg(feature = "gpu")]
 pub(crate) mod gpu_prove;
+#[cfg(feature = "gpu")]
+pub(crate) mod gpu_combine;
 
 #[derive(Clone, Debug)]
 pub struct SparseStatement<EF> {

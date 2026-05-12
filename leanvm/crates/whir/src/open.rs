@@ -420,23 +420,6 @@ where
 
         let (weights_packed, sum) = combine_statement::<EF>(statement, combination_randomness);
 
-        // GPU initial sumcheck: works correctly but the 805MB upload of
-        // combine_statement weights exceeds the GPU compute savings.
-        // Need GPU-native combine_statement to avoid this upload.
-        // Disabled: DFT→Merkle + PoW gives better results without this.
-        #[cfg(feature = "gpu")]
-        if false {
-            if let MleRef::Base(base_evals) = evals {
-                if std::mem::size_of::<PF<EF>>() == 4 && EF::DIMENSION == 5 {
-                    if let Some(result) = crate::gpu_prove::gpu_initial_sumcheck_rounds::<EF>(
-                        base_evals, &weights_packed, sum, prover_state, folding_factor, pow_bits,
-                    ) {
-                        return result;
-                    }
-                }
-            }
-        }
-
         let mut evals = evals.pack();
         let mut weights = Mle::Owned(MleOwned::ExtensionPacked(weights_packed));
         let (challengess, new_sum, new_evals, new_weights) = run_product_sumcheck(
