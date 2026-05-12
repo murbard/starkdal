@@ -72,6 +72,9 @@ where
         let effective_n_cols = actual_data_len.div_ceil(evals_len / n_blocks);
         let dft_n_cols = effective_n_cols.next_multiple_of(packing_width::<EF>()).min(n_blocks);
 
+        // CPU path for DFT (GPU DFT chaining pending correctness verification).
+        // Note: MerkleData::build → merkle_commit → build_merkle_tree_koalabear
+        // IS GPU-accelerated when the `gpu` feature is enabled.
         let folded_matrix = info_span!("FFT").in_scope(|| {
             reorder_and_dft(
                 &polynomial.by_ref(),
@@ -80,9 +83,6 @@ where
                 dft_n_cols,
             )
         });
-
-        // MerkleData::build calls build_merkle_tree_koalabear which is GPU-accelerated
-        // when the `gpu` feature is enabled (via gpu_backend::gpu_build_merkle_digests).
         let (prover_data, root) = MerkleData::build(folded_matrix, n_blocks, effective_n_cols);
 
         prover_state.add_base_scalars(&root);

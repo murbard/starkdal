@@ -61,15 +61,13 @@ fn build_merkle_tree_koalabear(
     full_base_width: usize,
     effective_base_width: usize,
 ) -> RoundMerkleTree<KoalaBear> {
-    // GPU fast path: compute leaf digests on GPU, then use CPU's from_first_layer
-    // for binary reduction (ensures correct layer padding for Merkle path opening).
+    // GPU fast path: leaf hashing + binary reduction on GPU.
+    // GPU tree layers now include correct padding for path opening.
     #[cfg(feature = "gpu")]
-    if let Some(gpu_digest_layers) = crate::gpu_backend::gpu_build_merkle_digests(
+    if let Some(digest_layers) = crate::gpu_backend::gpu_build_merkle_digests(
         &leaf.values, leaf.height(), full_base_width, leaf.width(),
     ) {
-        let first_layer = gpu_digest_layers.into_iter().next().unwrap();
-        let perm = default_koalabear_poseidon1_16();
-        let tree = symetric::merkle::MerkleTree::from_first_layer::<PFPacking<KoalaBear>, _, 16>(&perm, first_layer);
+        let tree = symetric::merkle::MerkleTree { digest_layers };
         return WhirMerkleTree { leaf, tree, full_leaf_base_width: full_base_width };
     }
 

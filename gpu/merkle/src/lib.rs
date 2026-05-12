@@ -138,12 +138,15 @@ impl GpuMerkle {
         let leaf_digests = self.stream.memcpy_dtov(&d_digests).unwrap();
         layers.push(leaf_digests);
 
-        // Phase 2: binary reduction.
+        // Phase 2: binary reduction with padding to match CPU's MerkleTree layer structure.
+        // CPU pads each layer to even length: next_len_padded = (n/2 + 1) & !1 (except root).
         let mut current = d_digests;
         let mut n = height;
         while n > 1 {
             let n_pairs = n / 2;
-            let mut d_parents = self.stream.alloc_zeros::<u32>((n_pairs as usize) * 8).unwrap();
+            // Pad to match CPU's compress_layer: next_len_padded = if n==2 { 1 } else { (n/2+1) & !1 }
+            let next_len_padded = if n == 2 { 1 } else { ((n_pairs + 1) & !1) as usize };
+            let mut d_parents = self.stream.alloc_zeros::<u32>(next_len_padded * 8).unwrap();
             {
                 let (child_ptr, _g1) = current.device_ptr(&self.stream);
                 let (parent_ptr, _g2) = d_parents.device_ptr_mut(&self.stream);
@@ -163,10 +166,11 @@ impl GpuMerkle {
             }
             self.stream.synchronize().unwrap();
 
+            // alloc_zeros already zeroed the padding slots.
             let layer_digests = self.stream.memcpy_dtov(&d_parents).unwrap();
             layers.push(layer_digests);
             current = d_parents;
-            n = n_pairs;
+            n = next_len_padded as u32;
         }
 
         let root = layers.last().unwrap().clone();
@@ -216,13 +220,15 @@ impl GpuMerkle {
         let leaf_digests = self.stream.memcpy_dtov(&d_digests).unwrap();
         layers.push(leaf_digests);
 
+        // Binary reduction with padding to match CPU's MerkleTree layer structure.
         let mut current = d_digests;
         let mut n = height;
         while n > 1 {
             let n_pairs = n / 2;
+            let next_len_padded = if n == 2 { 1 } else { ((n_pairs + 1) & !1) as usize };
             let mut d_parents = self
                 .stream
-                .alloc_zeros::<u32>((n_pairs as usize) * 8)
+                .alloc_zeros::<u32>(next_len_padded * 8)
                 .unwrap();
             {
                 let (child_ptr, _g1) = current.device_ptr(&self.stream);
@@ -251,7 +257,7 @@ impl GpuMerkle {
             let layer_digests = self.stream.memcpy_dtov(&d_parents).unwrap();
             layers.push(layer_digests);
             current = d_parents;
-            n = n_pairs;
+            n = next_len_padded as u32;
         }
 
         let root = layers.last().unwrap().clone();
