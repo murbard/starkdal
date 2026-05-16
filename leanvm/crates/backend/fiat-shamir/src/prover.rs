@@ -51,6 +51,19 @@ where
             merkle_paths: self.merkle_paths,
         }
     }
+
+    /// Inject GPU-produced transcript data and sync challenger state.
+    ///
+    /// This lets the GPU prover keep Fiat-Shamir state updates on device while
+    /// still materializing the final CPU proof transcript.
+    pub fn inject_gpu_transcript(&mut self, transcript_scalars: &[PF<EF>], challenger_state: [PF<EF>; RATE]) {
+        self.transcript.extend_from_slice(transcript_scalars);
+        self.challenger.state = challenger_state;
+    }
+
+    pub fn gpu_challenger_state(&self) -> [PF<EF>; RATE] {
+        self.challenger.state
+    }
 }
 
 impl<EF: ExtensionField<PF<EF>>, P: Compression<[PF<EF>; WIDTH]>> ChallengeSampler<EF> for ProverState<EF, P>
@@ -78,6 +91,14 @@ where
 
     fn observe_scalars(&mut self, scalars: &[PF<EF>]) {
         self.challenger.observe_scalars(scalars);
+    }
+
+    fn gpu_challenger_state(&self) -> [PF<EF>; 8] {
+        ProverState::gpu_challenger_state(self)
+    }
+
+    fn inject_gpu_transcript_state(&mut self, transcript_scalars: &[PF<EF>], challenger_state: [PF<EF>; 8]) {
+        self.inject_gpu_transcript(transcript_scalars, challenger_state);
     }
 
     fn state(&self) -> String {
@@ -129,9 +150,9 @@ where
             for (i, s) in self.challenger.state.iter().enumerate() {
                 state_u32[i] = unsafe { *(s as *const PF<EF> as *const u32) };
             }
-            if let Some(nonce) = gpu_pow_grind::GpuPowGrinder::grind_static(
-                &state_u32, RATE as u32, bits as u32, 1 << 28,
-            ) {
+            if let Some(nonce) =
+                gpu_pow_grind::GpuPowGrinder::grind_static(&state_u32, RATE as u32, bits as u32, 1 << 28)
+            {
                 let witness: PF<EF> = unsafe { *(&nonce as *const u32 as *const PF<EF>) };
                 self.challenger.observe_scalars(&[witness]);
                 assert!(self.challenger.state[0].as_canonical_u64() & ((1 << bits) - 1) == 0);

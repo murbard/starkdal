@@ -5,26 +5,27 @@ use backend::*;
 
 #[cfg(feature = "gpu")]
 fn gpu_sum_quotients_2_by_2<EF: ExtensionField<PF<EF>>>(
-    nums: &[EF], dens: &[EF], full_pairs: usize, new_active: usize,
+    nums: &[EF],
+    dens: &[EF],
+    full_pairs: usize,
+    new_active: usize,
 ) -> Option<(Vec<EF>, Vec<EF>)> {
     use std::sync::OnceLock;
     static GPU: OnceLock<Option<gpu_sumcheck::GpuSumcheck>> = OnceLock::new();
-    let gpu = GPU.get_or_init(|| {
-        let ctx = cudarc::driver::safe::CudaContext::new(0).ok()?;
-        let stream = ctx.default_stream();
-        Some(gpu_sumcheck::GpuSumcheck::new(stream))
-    }).as_ref()?;
+    let gpu = GPU
+        .get_or_init(|| {
+            let ctx = cudarc::driver::safe::CudaContext::new(0).ok()?;
+            let stream = ctx.default_stream();
+            Some(gpu_sumcheck::GpuSumcheck::new(stream))
+        })
+        .as_ref()?;
 
     let dim = EF::DIMENSION; // 5
     let n = nums.len();
 
     // Upload nums and dens as flat u32 arrays.
-    let nums_u32: &[u32] = unsafe {
-        std::slice::from_raw_parts(nums.as_ptr().cast::<u32>(), n * dim)
-    };
-    let dens_u32: &[u32] = unsafe {
-        std::slice::from_raw_parts(dens.as_ptr().cast::<u32>(), n * dim)
-    };
+    let nums_u32: &[u32] = unsafe { std::slice::from_raw_parts(nums.as_ptr().cast::<u32>(), n * dim) };
+    let dens_u32: &[u32] = unsafe { std::slice::from_raw_parts(dens.as_ptr().cast::<u32>(), n * dim) };
 
     let d_nums = gpu.stream().memcpy_stod(nums_u32).ok()?;
     let d_dens = gpu.stream().memcpy_stod(dens_u32).ok()?;
@@ -39,10 +40,10 @@ fn gpu_sum_quotients_2_by_2<EF: ExtensionField<PF<EF>>>(
     let mut new_dens: Vec<EF> = Vec::with_capacity(new_active);
     for i in 0..full_pairs {
         new_nums.push(unsafe {
-            std::mem::transmute_copy::<[u32; 5], EF>(&new_nums_u32[i*5..(i+1)*5].try_into().unwrap())
+            std::mem::transmute_copy::<[u32; 5], EF>(&new_nums_u32[i * 5..(i + 1) * 5].try_into().unwrap())
         });
         new_dens.push(unsafe {
-            std::mem::transmute_copy::<[u32; 5], EF>(&new_dens_u32[i*5..(i+1)*5].try_into().unwrap())
+            std::mem::transmute_copy::<[u32; 5], EF>(&new_dens_u32[i * 5..(i + 1) * 5].try_into().unwrap())
         });
     }
 

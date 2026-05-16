@@ -14,10 +14,11 @@ lean_vm.workspace = true
 backend.workspace = true
 
 gpu-sumcheck = { path = "../../../gpu/sumcheck", optional = true }
+gpu-poly-fold = { path = "../../../gpu/poly_fold", optional = true }
 cudarc = { version = "0.16", features = ["cuda-12060"], optional = true }
 
 [features]
-gpu = ["dep:gpu-sumcheck", "dep:cudarc"]
+gpu = ["dep:gpu-sumcheck", "dep:gpu-poly-fold", "dep:cudarc"]
 
 [dev-dependencies]
 

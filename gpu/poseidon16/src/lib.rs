@@ -6,16 +6,15 @@
 use std::ffi::CString;
 use std::sync::Arc;
 
-use koala_bear::{
-    KoalaBear, POSEIDON1_WIDTH,
-    default_koalabear_poseidon1_16, poseidon1_round_constants,
-    poseidon1_sparse_first_round_constants, poseidon1_sparse_first_row, poseidon1_sparse_m_i,
-    poseidon1_sparse_scalar_round_constants, poseidon1_sparse_v,
-};
-use koala_bear::symmetric::Permutation;
 use cudarc::driver::safe::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use cudarc::driver::{result as cuda_result, sys as cuda_sys};
 use field::PrimeField32;
+use koala_bear::symmetric::Permutation;
+use koala_bear::{
+    KoalaBear, POSEIDON1_WIDTH, default_koalabear_poseidon1_16, poseidon1_round_constants,
+    poseidon1_sparse_first_round_constants, poseidon1_sparse_first_row, poseidon1_sparse_m_i,
+    poseidon1_sparse_scalar_round_constants, poseidon1_sparse_v,
+};
 
 const WIDTH: usize = POSEIDON1_WIDTH;
 
@@ -48,11 +47,10 @@ impl Drop for GpuPoseidon16 {
 impl GpuPoseidon16 {
     /// Load the PTX module and upload all Poseidon16 constants to device constant memory.
     pub fn new(stream: Arc<CudaStream>) -> Self {
-        let ptx_src = include_str!(concat!(env!("OUT_DIR"), "/poseidon16.ptx"));
-        let c_src = CString::new(ptx_src).unwrap();
+        let cubin = include_bytes!(concat!(env!("OUT_DIR"), "/poseidon16.cubin"));
 
-        let cu_module = unsafe { cuda_result::module::load_data(c_src.as_ptr().cast()) }
-            .expect("failed to load PTX module");
+        let cu_module = unsafe { cuda_result::module::load_data(cubin.as_ptr().cast()) }
+            .expect("failed to load poseidon16 cubin");
 
         let compress_fn = {
             let name = CString::new("poseidon16_compress_kernel").unwrap();
@@ -135,14 +133,9 @@ impl GpuPoseidon16 {
         unsafe {
             let mut dptr: cuda_sys::CUdeviceptr = 0;
             let mut size: usize = 0;
-            cuda_sys::cuModuleGetGlobal_v2(
-                &mut dptr,
-                &mut size,
-                self.cu_module,
-                c_name.as_ptr(),
-            )
-            .result()
-            .unwrap_or_else(|e| panic!("cuModuleGetGlobal({name}): {e:?}"));
+            cuda_sys::cuModuleGetGlobal_v2(&mut dptr, &mut size, self.cu_module, c_name.as_ptr())
+                .result()
+                .unwrap_or_else(|e| panic!("cuModuleGetGlobal({name}): {e:?}"));
 
             let data_bytes = data.len() * std::mem::size_of::<u32>();
             assert!(
@@ -156,29 +149,37 @@ impl GpuPoseidon16 {
 
     /// Batch compress: (perm(state) + state)[0..8] for each of n states.
     pub fn compress_batch(&self, input: &CudaSlice<u32>, n: u32) -> CudaSlice<u32> {
-        let mut output = self
-            .stream
-            .alloc_zeros::<u32>((n as usize) * 8)
-            .unwrap();
+        let mut output = self.stream.alloc_zeros::<u32>((n as usize) * 8).unwrap();
 
         let threads_per_block = 256u32;
         let blocks = (n + threads_per_block - 1) / threads_per_block;
 
-        self.launch_kernel(self.compress_fn, blocks, threads_per_block, input, &mut output, n);
+        self.launch_kernel(
+            self.compress_fn,
+            blocks,
+            threads_per_block,
+            input,
+            &mut output,
+            n,
+        );
         output
     }
 
     /// Batch permute: full 16-element permutation for each of n states.
     pub fn permute_batch(&self, input: &CudaSlice<u32>, n: u32) -> CudaSlice<u32> {
-        let mut output = self
-            .stream
-            .alloc_zeros::<u32>((n as usize) * 16)
-            .unwrap();
+        let mut output = self.stream.alloc_zeros::<u32>((n as usize) * 16).unwrap();
 
         let threads_per_block = 256u32;
         let blocks = (n + threads_per_block - 1) / threads_per_block;
 
-        self.launch_kernel(self.permute_fn, blocks, threads_per_block, input, &mut output, n);
+        self.launch_kernel(
+            self.permute_fn,
+            blocks,
+            threads_per_block,
+            input,
+            &mut output,
+            n,
+        );
         output
     }
 
@@ -265,8 +266,7 @@ mod tests {
 
     #[test]
     fn test_cpu_compress_via_u32() {
-        let input_kb =
-            KoalaBear::new_array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+        let input_kb = KoalaBear::new_array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
         let input_u32: [u32; 16] = unsafe { std::mem::transmute(input_kb) };
 
         let p = default_koalabear_poseidon1_16();

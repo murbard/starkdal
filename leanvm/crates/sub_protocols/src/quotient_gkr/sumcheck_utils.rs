@@ -382,6 +382,100 @@ where
     debug_assert_eq!(dens.len(), nums.len());
     debug_assert_eq!(eq_within.len(), quarter);
 
+    // GPU fast path: unpack SIMD data → GPU interleaved kernel → unpack result.
+    // Only for ext-field denominators (which is always the case) and large data.
+    #[cfg(feature = "gpu")]
+    if std::mem::size_of::<PF<EF>>() == 4
+        && EF::DIMENSION == 5
+        && nums.len() >= 4096
+        && std::any::TypeId::of::<PF<EF>>() == std::any::TypeId::of::<backend::KoalaBear>()
+    {
+        use std::sync::OnceLock;
+        static GPU_SC: OnceLock<Option<gpu_sumcheck::GpuSumcheck>> = OnceLock::new();
+        if let Some(gpu) = GPU_SC
+            .get_or_init(|| {
+                let ctx = cudarc::driver::safe::CudaContext::new(0).ok()?;
+                Some(gpu_sumcheck::GpuSumcheck::new(ctx.default_stream()))
+            })
+            .as_ref()
+        {
+            // Unpack nums and dens to flat EF scalars.
+            let dim = EF::DIMENSION;
+            let pw = packing_width::<EF>();
+            let n_scalars = nums.len() * pw;
+            let chunk_size_scalar = layer_packed * pw; // scalars per chunk
+
+            // Unpack dens to flat u32.
+            let dens_unpacked = unpack_extension::<EF>(dens);
+            let dens_u32: &[u32] =
+                unsafe { std::slice::from_raw_parts(dens_unpacked.as_ptr().cast(), dens_unpacked.len() * dim) };
+
+            // Unpack nums to flat EF (base→ext embedding).
+            // Determine if nums are base-field packed or ext-field packed by size.
+            let nums_unpacked: Vec<EF> = if std::mem::size_of::<N>() == std::mem::size_of::<PFPacking<EF>>() {
+                let nums_pf: &[PFPacking<EF>] = unsafe { std::mem::transmute(nums) };
+                PFPacking::<EF>::unpack_slice(nums_pf)
+                    .iter()
+                    .map(|&x| EF::from(x))
+                    .collect()
+            } else {
+                let nums_ef: &[EFPacking<EF>] = unsafe { std::mem::transmute(nums) };
+                unpack_extension::<EF>(nums_ef)
+            };
+            let nums_u32: &[u32] =
+                unsafe { std::slice::from_raw_parts(nums_unpacked.as_ptr().cast(), nums_unpacked.len() * dim) };
+
+            // Unpack eq_within to flat EF.
+            let eq_w_unpacked = unpack_extension::<EF>(eq_within);
+            let eq_w_u32: &[u32] =
+                unsafe { std::slice::from_raw_parts(eq_w_unpacked.as_ptr().cast(), eq_w_unpacked.len() * dim) };
+
+            // eq_outer is already scalar EF.
+            let eq_o_u32: &[u32] =
+                unsafe { std::slice::from_raw_parts(eq_outer.as_ptr().cast(), eq_outer.len() * dim) };
+
+            let d_nums = gpu.stream().memcpy_stod(nums_u32).unwrap();
+            let d_dens = gpu.stream().memcpy_stod(dens_u32).unwrap();
+            let d_eq_w = gpu.stream().memcpy_stod(eq_w_u32).unwrap();
+            let d_eq_o = gpu.stream().memcpy_stod(eq_o_u32).unwrap();
+
+            let n_chunks = (n_scalars / chunk_size_scalar) as u32;
+            let (c0n, c2n, c0d, c2d) = gpu.gkr_quotient_sc_interleaved_device(
+                &d_nums,
+                &d_dens,
+                &d_eq_w,
+                &d_eq_o,
+                n_scalars as u32,
+                chunk_size_scalar as u32,
+                n_chunks,
+            );
+
+            // Convert GPU scalar results to packed format.
+            // The caller sums across lanes via `to_ext_iter([packed]).sum()`.
+            // Broadcasting the scalar to ALL lanes means the sum = scalar * width.
+            // Instead, put the scalar in lane 0 only (other lanes = 0).
+            //
+            // Packed layout: [comp0_lane0, comp0_lane1, ..., comp1_lane0, comp1_lane1, ...]
+            // With width = packing_width and dim = 5:
+            //   u32[comp * width + lane]
+            let to_packed = |v: &[u32; 5]| -> EFPacking<EF> {
+                let pw = packing_width::<EF>();
+                let dim = EF::DIMENSION;
+                let mut raw = vec![0u32; dim * pw];
+                for comp in 0..dim {
+                    raw[comp * pw + 0] = v[comp]; // lane 0 only
+                }
+                unsafe { std::ptr::read(raw.as_ptr().cast::<EFPacking<EF>>()) }
+            };
+            return RoundCoeffs {
+                c0_num: to_packed(&c0n),
+                c2_num: to_packed(&c2n),
+                c0_den: to_packed(&c0d),
+                c2_den: to_packed(&c2d),
+            };
+        }
+    }
+
     nums.par_chunks_exact(layer_packed)
         .zip(dens.par_chunks_exact(layer_packed))
         .enumerate()

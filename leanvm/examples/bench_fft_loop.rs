@@ -32,17 +32,23 @@ fn generate_program(cp: &CircuitParams) -> String {
     }
     // Butterfly layers: range() for group + j, tw[] runtime array
     for s in 1..=cp.log_total {
-        let m = 1usize << s; let half = m >> 1;
+        let m = 1usize << s;
+        let half = m >> 1;
         let stride = cp.n_eval >> s;
         let n_groups = cp.n_eval / m;
-        let prev = (s - 1) * cp.n_eval; let curr = s * cp.n_eval;
+        let prev = (s - 1) * cp.n_eval;
+        let curr = s * cp.n_eval;
         p.push_str(&format!("    for g{s} in range(0, {n_groups}):\n"));
         p.push_str(&format!("        gs{s} = g{s} * {m}\n"));
         p.push_str(&format!("        for j{s} in range(0, {half}):\n"));
         p.push_str(&format!("            u{s} = data[{prev} + gs{s} + j{s}]\n"));
-        p.push_str(&format!("            t{s} = tw[j{s} * {stride}] * data[{prev} + gs{s} + j{s} + {half}]\n"));
+        p.push_str(&format!(
+            "            t{s} = tw[j{s} * {stride}] * data[{prev} + gs{s} + j{s} + {half}]\n"
+        ));
         p.push_str(&format!("            data[{curr} + gs{s} + j{s}] = u{s} + t{s}\n"));
-        p.push_str(&format!("            data[{curr} + gs{s} + j{s} + {half}] = u{s} - t{s}\n"));
+        p.push_str(&format!(
+            "            data[{curr} + gs{s} + j{s} + {half}] = u{s} - t{s}\n"
+        ));
     }
     let evals_offset = cp.log_total * cp.n_eval;
     p.push_str(&format!("\n    evals_ptr = data + {evals_offset}\n\n"));
@@ -58,7 +64,11 @@ fn generate_program(cp: &CircuitParams) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let log_n: usize = args.iter().position(|a| a == "--log-n").map(|i| args[i+1].parse().unwrap()).unwrap_or(8);
+    let log_n: usize = args
+        .iter()
+        .position(|a| a == "--log-n")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(8);
     let log_blowup = 1usize;
     let cp = CircuitParams::new(log_n, log_blowup, pick_log_felts_per_leaf_kb(log_n + log_blowup));
     let coeffs: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
@@ -70,10 +80,13 @@ fn main() {
     hints.insert("twiddles".to_string(), vec![cp.twiddles.clone()]);
     let program = generate_program(&cp);
     let r = run_bench("FFT range loops", &cp, program, &pi, hints, 1);
-    println!("{}", serde_json::json!({
-        "variant": "fft_loop", "log_n": log_n,
-        "prove_s": (r.prove_time.as_secs_f64() * 1000.0).round() / 1000.0,
-        "cycles": r.metadata.cycles, "poseidons": r.metadata.n_poseidons,
-        "memory": r.metadata.memory, "peak_rss": r.peak_rss,
-    }));
+    println!(
+        "{}",
+        serde_json::json!({
+            "variant": "fft_loop", "log_n": log_n,
+            "prove_s": (r.prove_time.as_secs_f64() * 1000.0).round() / 1000.0,
+            "cycles": r.metadata.cycles, "poseidons": r.metadata.n_poseidons,
+            "memory": r.metadata.memory, "peak_rss": r.peak_rss,
+        })
+    );
 }

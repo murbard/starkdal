@@ -15,23 +15,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
-name = "backend"
-version = "0.1.0"
-dependencies = [
- "mt-air",
- "mt-fiat-shamir",
- "mt-field",
- "mt-koala-bear",
- "mt-poly",
- "mt-sumcheck",
- "mt-symetric",
- "mt-utils",
- "mt-whir",
- "rayon",
- "tracing",
-]
-
-[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -198,10 +181,10 @@ dependencies = [
 name = "gpu-trace-ops"
 version = "0.1.0"
 dependencies = [
- "backend",
  "cc",
  "cudarc",
  "mt-field",
+ "mt-koala-bear",
  "proptest",
  "rand 0.10.1",
 ]
@@ -301,27 +284,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "mt-air"
-version = "0.1.0"
-dependencies = [
- "mt-field",
- "mt-poly",
-]
-
-[[package]]
-name = "mt-fiat-shamir"
-version = "0.1.0"
-dependencies = [
- "mt-field",
- "mt-koala-bear",
- "mt-symetric",
- "mt-utils",
- "rayon",
- "serde",
- "tracing",
-]
-
-[[package]]
 name = "mt-field"
 version = "0.1.0"
 dependencies = [
@@ -351,62 +313,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "mt-poly"
-version = "0.1.0"
-dependencies = [
- "itertools",
- "mt-field",
- "mt-utils",
- "rand 0.10.1",
- "rayon",
- "serde",
- "system-info",
-]
-
-[[package]]
-name = "mt-sumcheck"
-version = "0.1.0"
-dependencies = [
- "mt-air",
- "mt-fiat-shamir",
- "mt-field",
- "mt-poly",
- "rayon",
- "tracing",
-]
-
-[[package]]
-name = "mt-symetric"
-version = "0.1.0"
-dependencies = [
- "mt-field",
- "mt-koala-bear",
- "rayon",
-]
-
-[[package]]
 name = "mt-utils"
 version = "0.1.0"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "mt-whir"
-version = "0.1.0"
-dependencies = [
- "itertools",
- "mt-fiat-shamir",
- "mt-field",
- "mt-koala-bear",
- "mt-poly",
- "mt-sumcheck",
- "mt-symetric",
- "mt-utils",
- "rand 0.10.1",
- "rayon",
- "system-info",
- "tracing",
 ]
 
 [[package]]
@@ -699,13 +609,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "system-info"
-version = "0.1.0"
-dependencies = [
- "libc",
 ]
 
 [[package]]

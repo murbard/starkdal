@@ -1,20 +1,15 @@
-//! GPU-accelerated STARK prover for leanVM.
+//! Legacy GPU prover prototype and low-level kernel harness.
 //!
-//! Provides `GpuProverContext` which holds all GPU modules, and
-//! `gpu_prove_execution` which reimplements the proving pipeline
-//! with GPU acceleration.
-//!
-//! Architecture:
-//! - CPU: VM execution, Fiat-Shamir (ProverState), proof assembly
-//! - GPU: All heavy compute (Merkle, NTT, sumcheck, folding, PoW, logup)
-//! - Sync points: ~200 bytes per sumcheck round (polynomial down, challenge up)
+//! The target generic end-to-end prover lives in `leanvm/crates/lean_prover`
+//! behind the `gpu` feature. This crate still contains CPU-orchestrated helper
+//! paths and must not be treated as satisfying the device-resident prover goal.
 
-pub mod gpu_whir;
+pub mod gpu_orchestrate;
 pub mod gpu_product_sumcheck;
 pub mod gpu_prove_execution;
 pub mod gpu_prover;
+pub mod gpu_whir;
 pub mod gpu_whir_protocol;
-pub mod gpu_orchestrate;
 
 use std::sync::Arc;
 
@@ -85,7 +80,8 @@ impl GpuProverContext {
         nonce_slot: u32,
         target_bits: u32,
     ) -> Option<u32> {
-        self.pow.grind(challenger_state, nonce_slot, target_bits, 1 << 28)
+        self.pow
+            .grind(challenger_state, nonce_slot, target_bits, 1 << 28)
     }
 
     /// NTT (evals DFT) on GPU.
@@ -94,21 +90,15 @@ impl GpuProverContext {
     }
 
     /// Fold base→ext on GPU.
-    pub fn gpu_fold_base_to_ext(
-        &self,
-        data: &[u32],
-        r_ext: &[u32; 5],
-    ) -> Vec<u32> {
-        self.fold.fold_base_to_ext(data, r_ext, gpu_poly_fold::FoldMode::Half)
+    pub fn gpu_fold_base_to_ext(&self, data: &[u32], r_ext: &[u32; 5]) -> Vec<u32> {
+        self.fold
+            .fold_base_to_ext(data, r_ext, gpu_poly_fold::FoldMode::Half)
     }
 
     /// Fold ext→ext on GPU.
-    pub fn gpu_fold_ext(
-        &self,
-        data: &[u32],
-        r_ext: &[u32; 5],
-    ) -> Vec<u32> {
-        self.fold.fold_ext(data, r_ext, gpu_poly_fold::FoldMode::Half)
+    pub fn gpu_fold_ext(&self, data: &[u32], r_ext: &[u32; 5]) -> Vec<u32> {
+        self.fold
+            .fold_ext(data, r_ext, gpu_poly_fold::FoldMode::Half)
     }
 
     /// Eq fold on GPU.
@@ -135,7 +125,8 @@ impl GpuProverContext {
         n_rows: u32,
         n_cols: u32,
     ) -> Vec<u32> {
-        self.logup.fingerprint(columns_flat, alphas, c, n_rows, n_cols)
+        self.logup
+            .fingerprint(columns_flat, alphas, c, n_rows, n_cols)
     }
 
     /// Shift down on GPU.

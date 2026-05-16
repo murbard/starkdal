@@ -454,6 +454,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "gpu-trace-ops"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "cudarc",
+ "mt-field",
+ "mt-koala-bear",
+ "rand",
+]
+
+[[package]]
 name = "hash32"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -587,6 +598,7 @@ dependencies = [
  "gpu-poly-fold",
  "gpu-pow-grind",
  "gpu-sumcheck",
+ "gpu-trace-ops",
  "itertools",
  "lean_compiler",
  "lean_vm",
@@ -1199,6 +1211,7 @@ version = "0.1.0"
 dependencies = [
  "backend",
  "cudarc",
+ "gpu-poly-fold",
  "gpu-sumcheck",
  "lean_vm",
  "rand",

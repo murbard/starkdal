@@ -125,7 +125,7 @@ fn prepare_evals_for_fft<EF: ExtensionField<PF<EF>>>(
 }
 
 #[instrument(skip_all)]
-fn prepare_evals_for_fft_unpacked<A: Copy + Send + Sync>(
+pub(crate) fn prepare_evals_for_fft_unpacked<A: Copy + Send + Sync>(
     evals: &[A],
     folding_factor: usize,
     log_inv_rate: usize,

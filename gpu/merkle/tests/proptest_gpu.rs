@@ -111,7 +111,9 @@ fn test_tree_4x16_sequential() {
 #[test]
 fn test_tree_large_256x32() {
     let g = gpu();
-    let data: Vec<u32> = (0..256 * 32).map(|i| ((i as u64 * 997 + 7) % P as u64) as u32).collect();
+    let data: Vec<u32> = (0..256 * 32)
+        .map(|i| ((i as u64 * 997 + 7) % P as u64) as u32)
+        .collect();
     let (gpu_root, _) = g.build_tree(&data, 256, 32, 32);
     let (cpu_root, _) = cpu_build_tree(&data, 256, 32, 32);
     assert_eq!(gpu_root, cpu_root);
@@ -120,7 +122,9 @@ fn test_tree_large_256x32() {
 #[test]
 fn test_tree_1024x16() {
     let g = gpu();
-    let data: Vec<u32> = (0..1024 * 16).map(|i| ((i as u64 * 1337 + 42) % P as u64) as u32).collect();
+    let data: Vec<u32> = (0..1024 * 16)
+        .map(|i| ((i as u64 * 1337 + 42) % P as u64) as u32)
+        .collect();
     let (gpu_root, _) = g.build_tree(&data, 1024, 16, 16);
     let (cpu_root, _) = cpu_build_tree(&data, 1024, 16, 16);
     assert_eq!(gpu_root, cpu_root);

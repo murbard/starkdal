@@ -43,6 +43,118 @@ extern "C" __global__ void access_count_simple_kernel(
     atomicAdd(&acc[addr], 1u);
 }
 
+// Convert canonical u32 counts to KoalaBear Montgomery form.
+extern "C" __global__ void canonical_to_monty_kernel(
+    const uint32_t* __restrict__ src,
+    uint32_t* __restrict__ dst,
+    uint32_t n
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    dst[tid] = kb_to_monty(src[tid]);
+}
+
+extern "C" __global__ void fill_base_kernel(
+    uint32_t* __restrict__ dst,
+    uint32_t value,
+    uint32_t n
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    dst[tid] = value;
+}
+
+extern "C" __global__ void negate_base_kernel(
+    const uint32_t* __restrict__ src,
+    uint32_t* __restrict__ dst,
+    uint32_t n
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    dst[tid] = kb_neg(src[tid]);
+}
+
+extern "C" __global__ void negate_ext_kernel(
+    const uint32_t* __restrict__ src,
+    uint32_t* __restrict__ dst,
+    uint32_t n
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    const uint32_t* in = src + tid * 5;
+    uint32_t* out = dst + tid * 5;
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+        out[k] = kb_neg(in[k]);
+    }
+}
+
+extern "C" __global__ void fill_ext_kernel(
+    uint32_t* __restrict__ dst,
+    uint32_t v0,
+    uint32_t v1,
+    uint32_t v2,
+    uint32_t v3,
+    uint32_t v4,
+    uint32_t n
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    dst[tid * 5 + 0] = v0;
+    dst[tid * 5 + 1] = v1;
+    dst[tid * 5 + 2] = v2;
+    dst[tid * 5 + 3] = v3;
+    dst[tid * 5 + 4] = v4;
+}
+
+extern "C" __global__ void fill_ext_offset_kernel(
+    uint32_t* __restrict__ dst,
+    uint32_t v0,
+    uint32_t v1,
+    uint32_t v2,
+    uint32_t v3,
+    uint32_t v4,
+    uint32_t n,
+    uint32_t dst_offset
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    uint32_t base = (dst_offset + tid) * 5;
+    dst[base + 0] = v0;
+    dst[base + 1] = v1;
+    dst[base + 2] = v2;
+    dst[base + 3] = v3;
+    dst[base + 4] = v4;
+}
+
+extern "C" __global__ void base_to_ext_kernel(
+    const uint32_t* __restrict__ src,
+    uint32_t* __restrict__ dst,
+    uint32_t n
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    qe_from_base(src[tid], dst + tid * 5);
+}
+
+extern "C" __global__ void bit_reverse_ext_within_chunks_kernel(
+    const uint32_t* __restrict__ data,
+    uint32_t* __restrict__ out,
+    uint32_t n_elems,
+    uint32_t chunk_log
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_elems) return;
+    uint32_t chunk_size = 1u << chunk_log;
+    uint32_t chunk_mask = chunk_size - 1;
+    uint32_t chunk_idx = tid / chunk_size;
+    uint32_t pos_in_chunk = tid & chunk_mask;
+    uint32_t rev = __brev(pos_in_chunk) >> (32 - chunk_log);
+    uint32_t dst_idx = chunk_idx * chunk_size + rev;
+    #pragma unroll
+    for (int k = 0; k < 5; k++) out[dst_idx * 5 + k] = data[tid * 5 + k];
+}
+
 // ── Polynomial stacking (column copy with offsets) ───────────────────────
 // Copy a column of n elements into a destination buffer at a given offset.
 extern "C" __global__ void copy_column_kernel(
@@ -67,6 +179,17 @@ extern "C" __global__ void shift_down_kernel(
     uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= n) return;
     dst[tid] = (tid < n - 1) ? src[tid + 1] : src[n - 1];
+}
+
+extern "C" __global__ void shift_down_to_offset_kernel(
+    const uint32_t* __restrict__ src,
+    uint32_t* __restrict__ dst,
+    uint32_t n,
+    uint32_t dst_offset
+) {
+    uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n) return;
+    dst[dst_offset + tid] = (tid < n - 1) ? src[tid + 1] : src[n - 1];
 }
 
 // ── Bit-reversal permutation ─────────────────────────────────────────────

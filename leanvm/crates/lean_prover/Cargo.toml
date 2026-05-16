@@ -8,7 +8,7 @@ workspace = true
 
 [features]
 prox-gaps-conjecture = []
-gpu = ["dep:gpu-sumcheck", "dep:gpu-poly-fold", "dep:gpu-ntt", "dep:gpu-merkle", "dep:gpu-pow-grind", "dep:cudarc", "sub_protocols/gpu"]
+gpu = ["dep:gpu-sumcheck", "dep:gpu-poly-fold", "dep:gpu-ntt", "dep:gpu-merkle", "dep:gpu-pow-grind", "dep:gpu-trace-ops", "dep:cudarc", "sub_protocols/gpu", "backend/gpu"]
 
 [dependencies]
 pest.workspace = true
@@ -28,6 +28,7 @@ gpu-poly-fold = { path = "../../../gpu/poly_fold", optional = true }
 gpu-ntt = { path = "../../../gpu/ntt", optional = true }
 gpu-merkle = { path = "../../../gpu/merkle", optional = true }
 gpu-pow-grind = { path = "../../../gpu/pow_grind", optional = true }
+gpu-trace-ops = { path = "../../../gpu/trace_ops", optional = true }
 cudarc = { version = "0.16", features = ["cuda-12060"], optional = true }
 
 [dev-dependencies]

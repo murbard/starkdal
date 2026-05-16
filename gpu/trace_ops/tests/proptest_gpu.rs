@@ -6,7 +6,9 @@ use proptest::prelude::*;
 
 const P: u32 = 0x7F000001;
 // Montgomery form of small canonical values (for use as addresses).
-fn to_monty(v: u32) -> u32 { (((v as u64) << 32) % P as u64) as u32 }
+fn to_monty(v: u32) -> u32 {
+    (((v as u64) << 32) % P as u64) as u32
+}
 
 fn gpu() -> GpuTraceOps {
     let ctx = CudaContext::new(0).expect("CUDA device required");
@@ -21,8 +23,12 @@ fn test_access_count_basic() {
     let g = gpu();
     // Column with addresses 0, 1, 2, 0, 1, 0 (in Montgomery form).
     let column: Vec<u32> = vec![
-        to_monty(0), to_monty(1), to_monty(2),
-        to_monty(0), to_monty(1), to_monty(0),
+        to_monty(0),
+        to_monty(1),
+        to_monty(2),
+        to_monty(0),
+        to_monty(1),
+        to_monty(0),
     ];
     let gpu_acc = g.access_count_simple(&column, 4);
     let cpu_acc = cpu_access_count_simple(&column, 4);
@@ -71,6 +77,20 @@ fn test_shift_down_basic() {
     let data = vec![10, 20, 30, 40, 50];
     let gpu_out = g.shift_down(&data);
     assert_eq!(gpu_out, vec![20, 30, 40, 50, 50]); // last element repeated
+}
+
+#[test]
+fn test_shift_down_to_offset_device() {
+    let g = gpu();
+    let stream = g.stream();
+    let src = vec![10, 20, 30, 40, 50];
+    let d_src = stream.memcpy_stod(&src).unwrap();
+    let mut d_dst = stream.alloc_zeros::<u32>(12).unwrap();
+
+    g.shift_down_to_offset_device(&d_src, &mut d_dst, src.len() as u32, 3);
+
+    let out = stream.memcpy_dtov(&d_dst).unwrap();
+    assert_eq!(out, vec![0, 0, 0, 20, 30, 40, 50, 50, 0, 0, 0, 0]);
 }
 
 // ── Bit-reversal tests ───────────────────────────────────────────────────
@@ -125,10 +145,7 @@ fn test_mle_eval_constant() {
 fn test_mle_eval_2var() {
     let g = gpu();
     let data = vec![10, 20, 30, 40]; // 2 variables
-    let point = [
-        [111 % P, 0, 0, 0, 0],
-        [222 % P, 0, 0, 0, 0],
-    ];
+    let point = [[111 % P, 0, 0, 0, 0], [222 % P, 0, 0, 0, 0]];
     let gpu_result = g.mle_eval(&data, &point);
     let cpu_result = cpu_mle_eval(&data, &point);
     assert_eq!(gpu_result, cpu_result);
@@ -180,7 +197,9 @@ fn test_mle_eval_large() {
     let g = gpu();
     let log_n = 14;
     let n = 1usize << log_n;
-    let data: Vec<u32> = (0..n).map(|i| ((i as u64 * 997 + 7) % P as u64) as u32).collect();
+    let data: Vec<u32> = (0..n)
+        .map(|i| ((i as u64 * 997 + 7) % P as u64) as u32)
+        .collect();
     let point: Vec<[u32; 5]> = (0..log_n)
         .map(|i| [((i as u64 * 1337 + 42) % P as u64) as u32, 0, 0, 0, 0])
         .collect();

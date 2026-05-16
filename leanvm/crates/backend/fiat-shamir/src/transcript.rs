@@ -36,6 +36,10 @@ pub struct Proof<F> {
 }
 
 impl<F: Field> Proof<F> {
+    pub fn transcript(&self) -> &[F] {
+        &self.transcript
+    }
+
     pub fn proof_size_fe(&self) -> usize {
         let merkle_size: usize = self
             .merkle_paths

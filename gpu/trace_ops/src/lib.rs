@@ -6,24 +6,37 @@
 use std::ffi::CString;
 use std::sync::Arc;
 
-use koala_bear::{KoalaBear, extension::QuinticExtensionField};
 use cudarc::driver::safe::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use cudarc::driver::{result as cuda_result, sys as cuda_sys};
-use field::{PrimeCharacteristicRing, PrimeField32};
+use field::PrimeField32;
+use koala_bear::{KoalaBear, extension::QuinticExtensionField};
 
 type EF = QuinticExtensionField<KoalaBear>;
 
-fn kb(v: u32) -> KoalaBear { unsafe { std::mem::transmute(v) } }
-fn kb_u32(v: KoalaBear) -> u32 { unsafe { std::mem::transmute(v) } }
+fn kb(v: u32) -> KoalaBear {
+    unsafe { std::mem::transmute(v) }
+}
+fn ef_u32(v: EF) -> [u32; 5] {
+    unsafe { std::mem::transmute(v) }
+}
 
 pub struct GpuTraceOps {
     stream: Arc<CudaStream>,
     cu_module: cuda_sys::CUmodule,
     fn_access_count: cuda_sys::CUfunction,
     fn_access_count_simple: cuda_sys::CUfunction,
+    fn_canonical_to_monty: cuda_sys::CUfunction,
+    fn_fill_base: cuda_sys::CUfunction,
+    fn_negate_base: cuda_sys::CUfunction,
+    fn_negate_ext: cuda_sys::CUfunction,
+    fn_fill_ext: cuda_sys::CUfunction,
+    fn_fill_ext_offset: cuda_sys::CUfunction,
+    fn_base_to_ext: cuda_sys::CUfunction,
     fn_copy_column: cuda_sys::CUfunction,
     fn_shift_down: cuda_sys::CUfunction,
+    fn_shift_down_to_offset: cuda_sys::CUfunction,
     fn_bit_reverse: cuda_sys::CUfunction,
+    fn_bit_reverse_ext: cuda_sys::CUfunction,
     fn_mle_fold_b2e: cuda_sys::CUfunction,
     fn_mle_fold_ext: cuda_sys::CUfunction,
 }
@@ -33,16 +46,17 @@ unsafe impl Sync for GpuTraceOps {}
 
 impl Drop for GpuTraceOps {
     fn drop(&mut self) {
-        unsafe { let _ = cuda_result::module::unload(self.cu_module); }
+        unsafe {
+            let _ = cuda_result::module::unload(self.cu_module);
+        }
     }
 }
 
 impl GpuTraceOps {
     pub fn new(stream: Arc<CudaStream>) -> Self {
-        let ptx_src = include_str!(concat!(env!("OUT_DIR"), "/trace_ops.ptx"));
-        let c_src = CString::new(ptx_src).unwrap();
-        let cu_module = unsafe { cuda_result::module::load_data(c_src.as_ptr().cast()) }
-            .expect("failed to load trace_ops PTX");
+        let cubin = include_bytes!(concat!(env!("OUT_DIR"), "/trace_ops.cubin"));
+        let cu_module = unsafe { cuda_result::module::load_data(cubin.as_ptr().cast()) }
+            .expect("failed to load trace_ops cubin");
 
         let load = |name: &str| {
             let c = CString::new(name).unwrap();
@@ -55,9 +69,18 @@ impl GpuTraceOps {
             cu_module,
             fn_access_count: load("access_count_kernel"),
             fn_access_count_simple: load("access_count_simple_kernel"),
+            fn_canonical_to_monty: load("canonical_to_monty_kernel"),
+            fn_fill_base: load("fill_base_kernel"),
+            fn_negate_base: load("negate_base_kernel"),
+            fn_negate_ext: load("negate_ext_kernel"),
+            fn_fill_ext: load("fill_ext_kernel"),
+            fn_fill_ext_offset: load("fill_ext_offset_kernel"),
+            fn_base_to_ext: load("base_to_ext_kernel"),
             fn_copy_column: load("copy_column_kernel"),
             fn_shift_down: load("shift_down_kernel"),
+            fn_shift_down_to_offset: load("shift_down_to_offset_kernel"),
             fn_bit_reverse: load("bit_reverse_kernel"),
+            fn_bit_reverse_ext: load("bit_reverse_ext_within_chunks_kernel"),
             fn_mle_fold_b2e: load("mle_fold_base_to_ext_kernel"),
             fn_mle_fold_ext: load("mle_fold_ext_kernel"),
         }
@@ -68,10 +91,313 @@ impl GpuTraceOps {
         let blocks = (n + threads - 1) / threads;
         unsafe {
             cuda_result::launch_kernel(
-                func, (blocks, 1, 1), (threads, 1, 1), 0,
-                self.stream.cu_stream(), args,
-            ).expect("kernel launch failed");
+                func,
+                (blocks, 1, 1),
+                (threads, 1, 1),
+                0,
+                self.stream.cu_stream(),
+                args,
+            )
+            .expect("kernel launch failed");
         }
+    }
+
+    /// Copy `n` elements from a device slice into `dst[dst_offset..]`.
+    ///
+    /// This keeps witness assembly on GPU when the source data is already
+    /// resident on device.
+    pub fn copy_to_offset_device<S, D>(&self, src: &S, dst: &mut D, n: u32, dst_offset: u32)
+    where
+        S: DevicePtr<u32>,
+        D: DevicePtrMut<u32>,
+    {
+        assert!(src.len() >= n as usize);
+        assert!(dst.len() >= dst_offset as usize + n as usize);
+        let (src_ptr, _g1) = src.device_ptr(&self.stream);
+        let (dst_ptr, _g2) = dst.device_ptr_mut(&self.stream);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &src_ptr as *const _ as *mut _,
+            &dst_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+            &dst_offset as *const _ as *mut _,
+        ];
+        self.launch(self.fn_copy_column, &mut args, n);
+    }
+
+    /// Histogram: for each column[i], increment acc[canonical(column[i]) + j]
+    /// for `j in 0..n_values`. Both buffers stay on device.
+    pub fn access_count_into_device<S, D>(&self, column: &S, acc: &mut D, n: u32, n_values: u32)
+    where
+        S: DevicePtr<u32>,
+        D: DevicePtrMut<u32>,
+    {
+        assert!(column.len() >= n as usize);
+        let (col_ptr, _g1) = column.device_ptr(&self.stream);
+        let (acc_ptr, _g2) = acc.device_ptr_mut(&self.stream);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &col_ptr as *const _ as *mut _,
+            &acc_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+            &n_values as *const _ as *mut _,
+        ];
+        self.launch(self.fn_access_count, &mut args, n);
+    }
+
+    /// Single-value histogram variant with device-resident input/output.
+    pub fn access_count_simple_into_device<S, D>(&self, column: &S, acc: &mut D, n: u32)
+    where
+        S: DevicePtr<u32>,
+        D: DevicePtrMut<u32>,
+    {
+        assert!(column.len() >= n as usize);
+        let (col_ptr, _g1) = column.device_ptr(&self.stream);
+        let (acc_ptr, _g2) = acc.device_ptr_mut(&self.stream);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &col_ptr as *const _ as *mut _,
+            &acc_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+        ];
+        self.launch(self.fn_access_count_simple, &mut args, n);
+    }
+
+    /// Convert canonical u32 counts to KoalaBear Montgomery form on device.
+    pub fn canonical_to_monty_device<S>(&self, src: &S, n: u32) -> CudaSlice<u32>
+    where
+        S: DevicePtr<u32>,
+    {
+        assert!(src.len() >= n as usize);
+        let mut d_out = self.stream.alloc_zeros::<u32>(n as usize).unwrap();
+        let src_ptr = {
+            let (p, _) = src.device_ptr(&self.stream);
+            p
+        };
+        let out_ptr = {
+            let (p, _) = d_out.device_ptr_mut(&self.stream);
+            p
+        };
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &src_ptr as *const _ as *mut _,
+            &out_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+        ];
+        self.launch(self.fn_canonical_to_monty, &mut args, n);
+        d_out
+    }
+
+    pub fn fill_base(&self, value: u32, n: u32) -> CudaSlice<u32> {
+        let mut d_out = self.stream.alloc_zeros::<u32>(n as usize).unwrap();
+        let out_ptr = {
+            let (p, _) = d_out.device_ptr_mut(&self.stream);
+            p
+        };
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &out_ptr as *const _ as *mut _,
+            &value as *const _ as *mut _,
+            &n as *const _ as *mut _,
+        ];
+        self.launch(self.fn_fill_base, &mut args, n);
+        d_out
+    }
+
+    pub fn negate_base<S>(&self, src: &S, n: u32) -> CudaSlice<u32>
+    where
+        S: DevicePtr<u32>,
+    {
+        let mut d_out = self.stream.alloc_zeros::<u32>(n as usize).unwrap();
+        self.negate_base_into(src, &mut d_out, n);
+        d_out
+    }
+
+    pub fn negate_base_into<S, D>(&self, src: &S, dst: &mut D, n: u32)
+    where
+        S: DevicePtr<u32>,
+        D: DevicePtrMut<u32>,
+    {
+        assert!(src.len() >= n as usize);
+        assert!(dst.len() >= n as usize);
+        let (src_ptr, _) = src.device_ptr(&self.stream);
+        let (out_ptr, _) = dst.device_ptr_mut(&self.stream);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &src_ptr as *const _ as *mut _,
+            &out_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+        ];
+        self.launch(self.fn_negate_base, &mut args, n);
+    }
+
+    pub fn negate_ext<S>(&self, src: &S, n: u32) -> CudaSlice<u32>
+    where
+        S: DevicePtr<u32>,
+    {
+        let mut d_out = self.stream.alloc_zeros::<u32>((n as usize) * 5).unwrap();
+        self.negate_ext_into(src, &mut d_out, n);
+        d_out
+    }
+
+    pub fn negate_ext_into<S, D>(&self, src: &S, dst: &mut D, n: u32)
+    where
+        S: DevicePtr<u32>,
+        D: DevicePtrMut<u32>,
+    {
+        assert!(src.len() >= (n as usize) * 5);
+        assert!(dst.len() >= (n as usize) * 5);
+        let (src_ptr, _) = src.device_ptr(&self.stream);
+        let (out_ptr, _) = dst.device_ptr_mut(&self.stream);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &src_ptr as *const _ as *mut _,
+            &out_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+        ];
+        self.launch(self.fn_negate_ext, &mut args, n);
+    }
+
+    pub fn fill_ext(&self, value: EF, n: u32) -> CudaSlice<u32> {
+        let mut d_out = self.stream.alloc_zeros::<u32>((n as usize) * 5).unwrap();
+        let value_words = ef_u32(value);
+        let out_ptr = {
+            let (p, _) = d_out.device_ptr_mut(&self.stream);
+            p
+        };
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &out_ptr as *const _ as *mut _,
+            &value_words[0] as *const _ as *mut _,
+            &value_words[1] as *const _ as *mut _,
+            &value_words[2] as *const _ as *mut _,
+            &value_words[3] as *const _ as *mut _,
+            &value_words[4] as *const _ as *mut _,
+            &n as *const _ as *mut _,
+        ];
+        self.launch(self.fn_fill_ext, &mut args, n);
+        d_out
+    }
+
+    pub fn fill_ext_at_offset<D>(&self, dst: &mut D, value: EF, n: u32, dst_offset: u32)
+    where
+        D: DevicePtrMut<u32>,
+    {
+        if n == 0 {
+            return;
+        }
+        assert!(dst.len() >= ((dst_offset + n) as usize) * 5);
+        let value_words = ef_u32(value);
+        let dst_ptr = {
+            let (p, _) = dst.device_ptr_mut(&self.stream);
+            p
+        };
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &dst_ptr as *const _ as *mut _,
+            &value_words[0] as *const _ as *mut _,
+            &value_words[1] as *const _ as *mut _,
+            &value_words[2] as *const _ as *mut _,
+            &value_words[3] as *const _ as *mut _,
+            &value_words[4] as *const _ as *mut _,
+            &n as *const _ as *mut _,
+            &dst_offset as *const _ as *mut _,
+        ];
+        self.launch(self.fn_fill_ext_offset, &mut args, n);
+    }
+
+    pub fn base_to_ext<S>(&self, src: &S, n: u32) -> CudaSlice<u32>
+    where
+        S: DevicePtr<u32>,
+    {
+        let mut d_out = self.stream.alloc_zeros::<u32>((n as usize) * 5).unwrap();
+        self.base_to_ext_into(src, n, &mut d_out);
+        d_out
+    }
+
+    pub fn base_to_ext_into<S, D>(&self, src: &S, n: u32, d_out: &mut D)
+    where
+        S: DevicePtr<u32>,
+        D: DevicePtrMut<u32>,
+    {
+        assert!(src.len() >= n as usize);
+        assert!(d_out.len() >= (n as usize) * 5);
+        let src_ptr = {
+            let (p, _) = src.device_ptr(&self.stream);
+            p
+        };
+        let out_ptr = {
+            let (p, _) = d_out.device_ptr_mut(&self.stream);
+            p
+        };
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &src_ptr as *const _ as *mut _,
+            &out_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+        ];
+        self.launch(self.fn_base_to_ext, &mut args, n);
+    }
+
+    pub fn bit_reverse_ext_within_chunks<S>(
+        &self,
+        src: &S,
+        n_elems: u32,
+        chunk_log: u32,
+    ) -> CudaSlice<u32>
+    where
+        S: DevicePtr<u32>,
+    {
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<u32>((n_elems as usize) * 5)
+            .unwrap();
+        self.bit_reverse_ext_within_chunks_into(src, &mut d_out, n_elems, chunk_log);
+        d_out
+    }
+
+    pub fn bit_reverse_ext_within_chunks_into<S, D>(
+        &self,
+        src: &S,
+        dst: &mut D,
+        n_elems: u32,
+        chunk_log: u32,
+    ) where
+        S: DevicePtr<u32>,
+        D: DevicePtrMut<u32>,
+    {
+        assert!(src.len() >= (n_elems as usize) * 5);
+        assert!(dst.len() >= (n_elems as usize) * 5);
+        let (src_ptr, _) = src.device_ptr(&self.stream);
+        let (out_ptr, _) = dst.device_ptr_mut(&self.stream);
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &src_ptr as *const _ as *mut _,
+            &out_ptr as *const _ as *mut _,
+            &n_elems as *const _ as *mut _,
+            &chunk_log as *const _ as *mut _,
+        ];
+        self.launch(self.fn_bit_reverse_ext, &mut args, n_elems);
+    }
+
+    /// Shift a device-resident column into `dst[dst_offset..]`.
+    ///
+    /// This matches AIR "down" semantics: `dst[i] = src[i + 1]` and the final
+    /// row repeats `src[n - 1]`.
+    pub fn shift_down_to_offset_device<S, D>(&self, src: &S, dst: &mut D, n: u32, dst_offset: u32)
+    where
+        S: DevicePtr<u32>,
+        D: DevicePtrMut<u32>,
+    {
+        if n == 0 {
+            return;
+        }
+        assert!(src.len() >= n as usize);
+        assert!(dst.len() >= dst_offset as usize + n as usize);
+        let src_ptr = {
+            let (p, _) = src.device_ptr(&self.stream);
+            p
+        };
+        let dst_ptr = {
+            let (p, _) = dst.device_ptr_mut(&self.stream);
+            p
+        };
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &src_ptr as *const _ as *mut _,
+            &dst_ptr as *const _ as *mut _,
+            &n as *const _ as *mut _,
+            &dst_offset as *const _ as *mut _,
+        ];
+        self.launch(self.fn_shift_down_to_offset, &mut args, n);
     }
 
     /// Histogram: for each column[i], increment acc[canonical(column[i])].
@@ -151,7 +477,10 @@ impl GpuTraceOps {
         let n_pairs = (data.len() / 2) as u32;
         let d_data = self.stream.memcpy_stod(data).unwrap();
         let d_r = self.stream.memcpy_stod(&point[0]).unwrap();
-        let mut d_ext = self.stream.alloc_zeros::<u32>((n_pairs as usize) * 5).unwrap();
+        let mut d_ext = self
+            .stream
+            .alloc_zeros::<u32>((n_pairs as usize) * 5)
+            .unwrap();
         {
             let (data_ptr, _g1) = d_data.device_ptr(&self.stream);
             let (out_ptr, _g2) = d_ext.device_ptr_mut(&self.stream);
@@ -194,7 +523,9 @@ impl GpuTraceOps {
         result[..5].try_into().unwrap()
     }
 
-    pub fn stream(&self) -> &Arc<CudaStream> { &self.stream }
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
 }
 
 // ── CPU references ───────────────────────────────────────────────────────
@@ -225,7 +556,9 @@ pub fn cpu_bit_reverse(data: &mut [u32]) {
     let shift = usize::BITS as usize - log_n;
     for i in 0..n {
         let j = i.reverse_bits() >> shift;
-        if i < j { data.swap(i, j); }
+        if i < j {
+            data.swap(i, j);
+        }
     }
 }
 
@@ -239,7 +572,8 @@ pub fn cpu_mle_eval(data: &[u32], point: &[[u32; 5]]) -> [u32; 5] {
 
     // First fold: base → ext with point[0].
     let r0: EF = unsafe { std::mem::transmute(point[0]) };
-    let mut current: Vec<[u32; 5]> = data.chunks_exact(2)
+    let mut current: Vec<[u32; 5]> = data
+        .chunks_exact(2)
         .map(|c| {
             let lo = kb(c[0]);
             let hi = kb(c[1]);
@@ -252,7 +586,8 @@ pub fn cpu_mle_eval(data: &[u32], point: &[[u32; 5]]) -> [u32; 5] {
     // Subsequent folds: ext → ext.
     for round in 1..log_n {
         let r: EF = unsafe { std::mem::transmute(point[round]) };
-        current = current.chunks_exact(2)
+        current = current
+            .chunks_exact(2)
             .map(|c| {
                 let lo: EF = unsafe { std::mem::transmute(c[0]) };
                 let hi: EF = unsafe { std::mem::transmute(c[1]) };

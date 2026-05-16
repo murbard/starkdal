@@ -31,10 +31,9 @@ impl Drop for GpuLogup {
 
 impl GpuLogup {
     pub fn new(stream: Arc<CudaStream>) -> Self {
-        let ptx_src = include_str!(concat!(env!("OUT_DIR"), "/logup.ptx"));
-        let c_src = CString::new(ptx_src).unwrap();
-        let cu_module = unsafe { cuda_result::module::load_data(c_src.as_ptr().cast()) }
-            .expect("failed to load logup PTX");
+        let cubin = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin"));
+        let cu_module = unsafe { cuda_result::module::load_data(cubin.as_ptr().cast()) }
+            .expect("failed to load logup cubin");
 
         let load = |name: &str| {
             let c = CString::new(name).unwrap();

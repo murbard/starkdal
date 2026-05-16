@@ -16,11 +16,11 @@ where
     EF: ExtensionField<PF<EF>>,
     PF<EF>: TwoAdicField,
 {
-    fn validate_parameters(&self) -> bool {
+    pub(crate) fn validate_parameters(&self) -> bool {
         self.num_variables == self.folding_factor.total_number(self.n_rounds()) + self.final_sumcheck_rounds
     }
 
-    fn validate_statement(&self, statement: &[SparseStatement<EF>]) {
+    pub(crate) fn validate_statement(&self, statement: &[SparseStatement<EF>]) {
         statement.iter().for_each(|e| {
             assert_eq!(e.total_num_variables, self.num_variables);
             assert!(!e.values.is_empty());
@@ -28,7 +28,7 @@ where
         });
     }
 
-    fn validate_witness(&self, witness: &Witness<EF>, polynomial: &MleRef<'_, EF>) -> bool {
+    pub(crate) fn validate_witness(&self, witness: &Witness<EF>, polynomial: &MleRef<'_, EF>) -> bool {
         assert_eq!(witness.ood_points.len(), witness.ood_answers.len());
         polynomial.n_vars() == self.num_variables
     }
@@ -423,11 +423,17 @@ where
         if let MleRef::Base(base_evals) = evals {
             if std::mem::size_of::<PF<EF>>() == 4 && EF::DIMENSION == 5 {
                 let num_variables = statement[0].total_num_variables;
-                if let Some((d_weights, sum)) = crate::gpu_combine::gpu_combine_statement(
-                    &statement, combination_randomness, num_variables,
-                ) {
+                if let Some((d_weights, sum)) =
+                    crate::gpu_combine::gpu_combine_statement(&statement, combination_randomness, num_variables)
+                {
                     if let Some(result) = crate::gpu_prove::gpu_initial_sumcheck_with_device_weights::<EF>(
-                        base_evals, d_weights, sum, prover_state, folding_factor, pow_bits, num_variables,
+                        base_evals,
+                        d_weights,
+                        sum,
+                        prover_state,
+                        folding_factor,
+                        pow_bits,
+                        num_variables,
                     ) {
                         return result;
                     }
@@ -435,9 +441,8 @@ where
             }
         }
 
-        let (weights_packed, sum) = info_span!("combine_statement").in_scope(||
-            combine_statement::<EF>(statement, combination_randomness)
-        );
+        let (weights_packed, sum) =
+            info_span!("combine_statement").in_scope(|| combine_statement::<EF>(statement, combination_randomness));
         let mut evals = evals.pack();
         let mut weights = Mle::Owned(MleOwned::ExtensionPacked(weights_packed));
         let (challengess, new_sum, new_evals, new_weights) = run_product_sumcheck(

@@ -7,15 +7,14 @@
 use std::ffi::CString;
 use std::sync::Arc;
 
+use cudarc::driver::safe::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::{result as cuda_result, sys as cuda_sys};
+use koala_bear::symmetric::Permutation;
 use koala_bear::{
-    KoalaBear, POSEIDON1_WIDTH, default_koalabear_poseidon1_16,
-    poseidon1_round_constants,
+    KoalaBear, POSEIDON1_WIDTH, default_koalabear_poseidon1_16, poseidon1_round_constants,
     poseidon1_sparse_first_round_constants, poseidon1_sparse_first_row, poseidon1_sparse_m_i,
     poseidon1_sparse_scalar_round_constants, poseidon1_sparse_v,
 };
-use koala_bear::symmetric::Permutation;
-use cudarc::driver::safe::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
-use cudarc::driver::{result as cuda_result, sys as cuda_sys};
 
 pub const DIGEST_ELEMS: usize = 8;
 const WIDTH: usize = POSEIDON1_WIDTH;
@@ -29,6 +28,31 @@ pub struct GpuMerkle {
     cu_module: cuda_sys::CUmodule,
     fn_leaf_hash: cuda_sys::CUfunction,
     fn_reduce: cuda_sys::CUfunction,
+    fn_eval_rows: cuda_sys::CUfunction,
+    fn_gather_rows: cuda_sys::CUfunction,
+    fn_gather_siblings: cuda_sys::CUfunction,
+}
+
+#[derive(Debug)]
+pub struct DeviceMerkleTree {
+    pub layers: Vec<Arc<CudaSlice<u32>>>,
+}
+
+fn merkle_layer_word_lengths(height: u32) -> Vec<usize> {
+    let mut lengths = Vec::new();
+    let mut n = height;
+    lengths.push((n as usize) * DIGEST_ELEMS);
+    while n > 1 {
+        let n_pairs = n / 2;
+        let next_len_padded = if n == 2 {
+            1
+        } else {
+            ((n_pairs + 1) & !1) as usize
+        };
+        lengths.push(next_len_padded * DIGEST_ELEMS);
+        n = next_len_padded as u32;
+    }
+    lengths
 }
 
 unsafe impl Send for GpuMerkle {}
@@ -36,16 +60,28 @@ unsafe impl Sync for GpuMerkle {}
 
 impl Drop for GpuMerkle {
     fn drop(&mut self) {
-        unsafe { let _ = cuda_result::module::unload(self.cu_module); }
+        unsafe {
+            let _ = cuda_result::module::unload(self.cu_module);
+        }
     }
 }
 
 impl GpuMerkle {
+    pub fn allocate_tree_layers(stream: &Arc<CudaStream>, height: u32) -> Vec<CudaSlice<u32>> {
+        merkle_layer_word_lengths(height)
+            .into_iter()
+            .map(|len| {
+                stream
+                    .alloc_zeros::<u32>(len)
+                    .expect("alloc Merkle tree layer workspace")
+            })
+            .collect()
+    }
+
     pub fn new(stream: Arc<CudaStream>) -> Self {
-        let ptx_src = include_str!(concat!(env!("OUT_DIR"), "/merkle.ptx"));
-        let c_src = CString::new(ptx_src).unwrap();
-        let cu_module = unsafe { cuda_result::module::load_data(c_src.as_ptr().cast()) }
-            .expect("failed to load merkle PTX");
+        let cubin = include_bytes!(concat!(env!("OUT_DIR"), "/merkle.cubin"));
+        let cu_module = unsafe { cuda_result::module::load_data(cubin.as_ptr().cast()) }
+            .expect("failed to load merkle cubin");
 
         let load = |name: &str| {
             let c = CString::new(name).unwrap();
@@ -58,6 +94,9 @@ impl GpuMerkle {
             cu_module,
             fn_leaf_hash: load("merkle_leaf_hash_kernel"),
             fn_reduce: load("merkle_reduce_kernel"),
+            fn_eval_rows: load("merkle_eval_rows_at_randomness_kernel"),
+            fn_gather_rows: load("merkle_gather_rows_kernel"),
+            fn_gather_siblings: load("merkle_gather_sibling_hashes_kernel"),
         };
         this.upload_poseidon_constants();
         this
@@ -65,24 +104,50 @@ impl GpuMerkle {
 
     fn upload_poseidon_constants(&mut self) {
         let rc = poseidon1_round_constants();
-        let rc_flat: Vec<u32> = rc.iter().flat_map(|r| kb_slice_as_u32(r)).copied().collect();
+        let rc_flat: Vec<u32> = rc
+            .iter()
+            .flat_map(|r| kb_slice_as_u32(r))
+            .copied()
+            .collect();
         self.copy_sym("d_rc", &rc_flat);
 
-        let mds_col_kb = KoalaBear::new_array([1,3,13,22,67,2,15,63,101,1,2,17,11,1,51,1]);
+        let mds_col_kb =
+            KoalaBear::new_array([1, 3, 13, 22, 67, 2, 15, 63, 101, 1, 2, 17, 11, 1, 51, 1]);
         let mds_col = kb_slice_as_u32(&mds_col_kb);
         let mut mds_flat = vec![0u32; WIDTH * WIDTH];
-        for i in 0..WIDTH { for j in 0..WIDTH { mds_flat[i*WIDTH+j] = mds_col[(WIDTH+i-j)%WIDTH]; } }
+        for i in 0..WIDTH {
+            for j in 0..WIDTH {
+                mds_flat[i * WIDTH + j] = mds_col[(WIDTH + i - j) % WIDTH];
+            }
+        }
         self.copy_sym("d_mds", &mds_flat);
 
-        self.copy_sym("d_sparse_first_rc", kb_slice_as_u32(poseidon1_sparse_first_round_constants()));
-        let m_i: Vec<u32> = poseidon1_sparse_m_i().iter().flat_map(|r| kb_slice_as_u32(r)).copied().collect();
+        self.copy_sym(
+            "d_sparse_first_rc",
+            kb_slice_as_u32(poseidon1_sparse_first_round_constants()),
+        );
+        let m_i: Vec<u32> = poseidon1_sparse_m_i()
+            .iter()
+            .flat_map(|r| kb_slice_as_u32(r))
+            .copied()
+            .collect();
         self.copy_sym("d_sparse_m_i", &m_i);
-        let fr: Vec<u32> = poseidon1_sparse_first_row().iter().flat_map(|r| kb_slice_as_u32(r)).copied().collect();
+        let fr: Vec<u32> = poseidon1_sparse_first_row()
+            .iter()
+            .flat_map(|r| kb_slice_as_u32(r))
+            .copied()
+            .collect();
         self.copy_sym("d_sparse_first_row", &fr);
-        let v: Vec<u32> = poseidon1_sparse_v().iter().flat_map(|r| kb_slice_as_u32(r)).copied().collect();
+        let v: Vec<u32> = poseidon1_sparse_v()
+            .iter()
+            .flat_map(|r| kb_slice_as_u32(r))
+            .copied()
+            .collect();
         self.copy_sym("d_sparse_v", &v);
-        let src: Vec<u32> = poseidon1_sparse_scalar_round_constants().iter()
-            .map(|c| kb_slice_as_u32(std::slice::from_ref(c))[0]).collect();
+        let src: Vec<u32> = poseidon1_sparse_scalar_round_constants()
+            .iter()
+            .map(|c| kb_slice_as_u32(std::slice::from_ref(c))[0])
+            .collect();
         self.copy_sym("d_sparse_scalar_rc", &src);
     }
 
@@ -92,7 +157,8 @@ impl GpuMerkle {
             let mut dptr: cuda_sys::CUdeviceptr = 0;
             let mut size: usize = 0;
             cuda_sys::cuModuleGetGlobal_v2(&mut dptr, &mut size, self.cu_module, c_name.as_ptr())
-                .result().unwrap_or_else(|e| panic!("cuModuleGetGlobal({name}): {e:?}"));
+                .result()
+                .unwrap_or_else(|e| panic!("cuModuleGetGlobal({name}): {e:?}"));
             assert!(data.len() * 4 <= size);
             cuda_result::memcpy_htod_sync(dptr, data).unwrap();
         }
@@ -112,84 +178,10 @@ impl GpuMerkle {
         let d_matrix = self.stream.memcpy_stod(matrix).unwrap();
 
         // Phase 1: leaf hashing.
-        let mut d_digests = self.stream.alloc_zeros::<u32>((height as usize) * 8).unwrap();
-        {
-            let (mat_ptr, _g1) = d_matrix.device_ptr(&self.stream);
-            let (dig_ptr, _g2) = d_digests.device_ptr_mut(&self.stream);
-            let threads = 256u32;
-            let blocks = (height + threads - 1) / threads;
-            let mut args: Vec<*mut std::ffi::c_void> = vec![
-                &mat_ptr as *const _ as *mut _,
-                &dig_ptr as *const _ as *mut _,
-                &height as *const _ as *mut _,
-                &row_width as *const _ as *mut _,
-                &row_stride as *const _ as *mut _,
-            ];
-            unsafe {
-                cuda_result::launch_kernel(
-                    self.fn_leaf_hash, (blocks, 1, 1), (threads, 1, 1),
-                    0, self.stream.cu_stream(), &mut args,
-                ).expect("leaf hash kernel failed");
-            }
-        }
-        self.stream.synchronize().unwrap();
-
-        let mut layers = Vec::new();
-        let leaf_digests = self.stream.memcpy_dtov(&d_digests).unwrap();
-        layers.push(leaf_digests);
-
-        // Phase 2: binary reduction with padding to match CPU's MerkleTree layer structure.
-        // CPU pads each layer to even length: next_len_padded = (n/2 + 1) & !1 (except root).
-        let mut current = d_digests;
-        let mut n = height;
-        while n > 1 {
-            let n_pairs = n / 2;
-            // Pad to match CPU's compress_layer: next_len_padded = if n==2 { 1 } else { (n/2+1) & !1 }
-            let next_len_padded = if n == 2 { 1 } else { ((n_pairs + 1) & !1) as usize };
-            let mut d_parents = self.stream.alloc_zeros::<u32>(next_len_padded * 8).unwrap();
-            {
-                let (child_ptr, _g1) = current.device_ptr(&self.stream);
-                let (parent_ptr, _g2) = d_parents.device_ptr_mut(&self.stream);
-                let threads = 256u32;
-                let blocks = (n_pairs + threads - 1) / threads;
-                let mut args: Vec<*mut std::ffi::c_void> = vec![
-                    &child_ptr as *const _ as *mut _,
-                    &parent_ptr as *const _ as *mut _,
-                    &n_pairs as *const _ as *mut _,
-                ];
-                unsafe {
-                    cuda_result::launch_kernel(
-                        self.fn_reduce, (blocks, 1, 1), (threads, 1, 1),
-                        0, self.stream.cu_stream(), &mut args,
-                    ).expect("reduce kernel failed");
-                }
-            }
-            self.stream.synchronize().unwrap();
-
-            // alloc_zeros already zeroed the padding slots.
-            let layer_digests = self.stream.memcpy_dtov(&d_parents).unwrap();
-            layers.push(layer_digests);
-            current = d_parents;
-            n = next_len_padded as u32;
-        }
-
-        let root = layers.last().unwrap().clone();
-        (root, layers)
-    }
-
-    /// Build Merkle tree from device-resident data (no htod copy needed).
-    pub fn build_tree_from_device(
-        &self,
-        d_matrix: &CudaSlice<u32>,
-        height: u32,
-        row_width: u32,
-        row_stride: u32,
-    ) -> (Vec<u32>, Vec<Vec<u32>>) {
         let mut d_digests = self
             .stream
             .alloc_zeros::<u32>((height as usize) * 8)
             .unwrap();
-
         {
             let (mat_ptr, _g1) = d_matrix.device_ptr(&self.stream);
             let (dig_ptr, _g2) = d_digests.device_ptr_mut(&self.stream);
@@ -220,16 +212,19 @@ impl GpuMerkle {
         let leaf_digests = self.stream.memcpy_dtov(&d_digests).unwrap();
         layers.push(leaf_digests);
 
-        // Binary reduction with padding to match CPU's MerkleTree layer structure.
+        // Phase 2: binary reduction with padding to match CPU's MerkleTree layer structure.
+        // CPU pads each layer to even length: next_len_padded = (n/2 + 1) & !1 (except root).
         let mut current = d_digests;
         let mut n = height;
         while n > 1 {
             let n_pairs = n / 2;
-            let next_len_padded = if n == 2 { 1 } else { ((n_pairs + 1) & !1) as usize };
-            let mut d_parents = self
-                .stream
-                .alloc_zeros::<u32>(next_len_padded * 8)
-                .unwrap();
+            // Pad to match CPU's compress_layer: next_len_padded = if n==2 { 1 } else { (n/2+1) & !1 }
+            let next_len_padded = if n == 2 {
+                1
+            } else {
+                ((n_pairs + 1) & !1) as usize
+            };
+            let mut d_parents = self.stream.alloc_zeros::<u32>(next_len_padded * 8).unwrap();
             {
                 let (child_ptr, _g1) = current.device_ptr(&self.stream);
                 let (parent_ptr, _g2) = d_parents.device_ptr_mut(&self.stream);
@@ -254,6 +249,7 @@ impl GpuMerkle {
             }
             self.stream.synchronize().unwrap();
 
+            // alloc_zeros already zeroed the padding slots.
             let layer_digests = self.stream.memcpy_dtov(&d_parents).unwrap();
             layers.push(layer_digests);
             current = d_parents;
@@ -264,7 +260,407 @@ impl GpuMerkle {
         (root, layers)
     }
 
-    pub fn stream(&self) -> &Arc<CudaStream> { &self.stream }
+    /// Build Merkle tree from device-resident data (no htod copy needed).
+    pub fn build_tree_from_device(
+        &self,
+        d_matrix: &CudaSlice<u32>,
+        height: u32,
+        row_width: u32,
+        row_stride: u32,
+    ) -> (Vec<u32>, Vec<Vec<u32>>) {
+        let (d_root, device_tree) = self
+            .build_tree_from_device_resident_root_device(d_matrix, height, row_width, row_stride);
+        let root = self.stream.memcpy_dtov(&*d_root).unwrap();
+        let layers = device_tree
+            .layers
+            .iter()
+            .map(|layer| self.stream.memcpy_dtov(&**layer).unwrap())
+            .collect();
+        (root, layers)
+    }
+
+    /// Build a Merkle tree from device-resident data while keeping every layer on device.
+    ///
+    /// Returns the root digest on host and all tree layers as device buffers.
+    pub fn build_tree_from_device_resident(
+        &self,
+        d_matrix: &CudaSlice<u32>,
+        height: u32,
+        row_width: u32,
+        row_stride: u32,
+    ) -> (Vec<u32>, DeviceMerkleTree) {
+        let (d_root, device_tree) = self
+            .build_tree_from_device_resident_root_device(d_matrix, height, row_width, row_stride);
+        let root = self.stream.memcpy_dtov(&*d_root).unwrap();
+        (root, device_tree)
+    }
+
+    /// Build a Merkle tree from device-resident data while keeping every layer
+    /// and the root digest on device.
+    pub fn build_tree_from_device_resident_root_device(
+        &self,
+        d_matrix: &CudaSlice<u32>,
+        height: u32,
+        row_width: u32,
+        row_stride: u32,
+    ) -> (Arc<CudaSlice<u32>>, DeviceMerkleTree) {
+        let d_layers = Self::allocate_tree_layers(&self.stream, height);
+        self.build_tree_from_device_resident_root_device_into(
+            d_matrix, height, row_width, row_stride, d_layers,
+        )
+    }
+
+    pub fn build_tree_from_device_resident_root_device_into(
+        &self,
+        d_matrix: &CudaSlice<u32>,
+        height: u32,
+        row_width: u32,
+        row_stride: u32,
+        d_layers: Vec<CudaSlice<u32>>,
+    ) -> (Arc<CudaSlice<u32>>, DeviceMerkleTree) {
+        let expected_lengths = merkle_layer_word_lengths(height);
+        assert_eq!(
+            d_layers.len(),
+            expected_lengths.len(),
+            "Merkle tree workspace layer count mismatch"
+        );
+        for (idx, (layer, expected_len)) in d_layers.iter().zip(expected_lengths.iter()).enumerate()
+        {
+            assert!(
+                layer.len() >= *expected_len,
+                "Merkle tree workspace layer {idx} too small"
+            );
+        }
+
+        let mut d_layers = d_layers.into_iter();
+        let mut d_digests = d_layers
+            .next()
+            .expect("Merkle tree workspace must include leaf digest layer");
+
+        {
+            let (mat_ptr, _g1) = d_matrix.device_ptr(&self.stream);
+            let (dig_ptr, _g2) = d_digests.device_ptr_mut(&self.stream);
+            let threads = 256u32;
+            let blocks = (height + threads - 1) / threads;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &mat_ptr as *const _ as *mut _,
+                &dig_ptr as *const _ as *mut _,
+                &height as *const _ as *mut _,
+                &row_width as *const _ as *mut _,
+                &row_stride as *const _ as *mut _,
+            ];
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_leaf_hash,
+                    (blocks, 1, 1),
+                    (threads, 1, 1),
+                    0,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("leaf hash kernel failed");
+            }
+        }
+        let mut layers = vec![Arc::new(d_digests)];
+
+        // Binary reduction with padding to match CPU's MerkleTree layer structure.
+        let mut n = height;
+        while n > 1 {
+            let n_pairs = n / 2;
+            let next_len_padded = if n == 2 {
+                1
+            } else {
+                ((n_pairs + 1) & !1) as usize
+            };
+            let mut d_parents = d_layers
+                .next()
+                .expect("Merkle tree workspace missing parent layer");
+            {
+                let current = layers.last().unwrap();
+                let (child_ptr, _g1) = current.device_ptr(&self.stream);
+                let (parent_ptr, _g2) = d_parents.device_ptr_mut(&self.stream);
+                let threads = 256u32;
+                let blocks = (n_pairs + threads - 1) / threads;
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    &child_ptr as *const _ as *mut _,
+                    &parent_ptr as *const _ as *mut _,
+                    &n_pairs as *const _ as *mut _,
+                ];
+                unsafe {
+                    cuda_result::launch_kernel(
+                        self.fn_reduce,
+                        (blocks, 1, 1),
+                        (threads, 1, 1),
+                        0,
+                        self.stream.cu_stream(),
+                        &mut args,
+                    )
+                    .expect("reduce kernel failed");
+                }
+            }
+            layers.push(Arc::new(d_parents));
+            n = next_len_padded as u32;
+        }
+        assert!(
+            d_layers.next().is_none(),
+            "Merkle tree workspace has unused extra layers"
+        );
+
+        let d_root = layers.last().unwrap().clone();
+        (d_root, DeviceMerkleTree { layers })
+    }
+
+    pub fn eval_rows_at_randomness_device<P>(
+        &self,
+        d_leaf_matrix: &CudaSlice<u32>,
+        d_indices: &CudaSlice<u32>,
+        n_samples: u32,
+        full_leaf_base_width: u32,
+        d_point_words: &P,
+        n_coords: u32,
+        is_extension: bool,
+    ) -> CudaSlice<u32>
+    where
+        P: DevicePtr<u32>,
+    {
+        let d_out = self.eval_rows_at_randomness_device_async(
+            d_leaf_matrix,
+            d_indices,
+            n_samples,
+            full_leaf_base_width,
+            d_point_words,
+            n_coords,
+            is_extension,
+        );
+        self.stream.synchronize().unwrap();
+        d_out
+    }
+
+    pub fn eval_rows_at_randomness_device_async<P>(
+        &self,
+        d_leaf_matrix: &CudaSlice<u32>,
+        d_indices: &CudaSlice<u32>,
+        n_samples: u32,
+        full_leaf_base_width: u32,
+        d_point_words: &P,
+        n_coords: u32,
+        is_extension: bool,
+    ) -> CudaSlice<u32>
+    where
+        P: DevicePtr<u32>,
+    {
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<u32>((n_samples as usize) * 5)
+            .unwrap();
+        self.eval_rows_at_randomness_device_into_async(
+            d_leaf_matrix,
+            d_indices,
+            n_samples,
+            full_leaf_base_width,
+            d_point_words,
+            n_coords,
+            is_extension,
+            &mut d_out,
+        );
+        d_out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn eval_rows_at_randomness_device_into_async<P>(
+        &self,
+        d_leaf_matrix: &CudaSlice<u32>,
+        d_indices: &CudaSlice<u32>,
+        n_samples: u32,
+        full_leaf_base_width: u32,
+        d_point_words: &P,
+        n_coords: u32,
+        is_extension: bool,
+        d_out: &mut CudaSlice<u32>,
+    ) where
+        P: DevicePtr<u32>,
+    {
+        assert!(d_indices.len() >= n_samples as usize);
+        assert!(d_out.len() >= (n_samples as usize) * 5);
+        if n_samples == 0 {
+            return;
+        }
+        let shared_words = if is_extension {
+            full_leaf_base_width as usize
+        } else {
+            (full_leaf_base_width as usize) * 5
+        };
+        {
+            let (leaf_ptr, _g1) = d_leaf_matrix.device_ptr(&self.stream);
+            let (idx_ptr, _g2) = d_indices.device_ptr(&self.stream);
+            let (point_ptr, _g3) = d_point_words.device_ptr(&self.stream);
+            let (out_ptr, _g4) = d_out.device_ptr_mut(&self.stream);
+            let is_extension_u32 = if is_extension { 1u32 } else { 0u32 };
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &leaf_ptr as *const _ as *mut _,
+                &idx_ptr as *const _ as *mut _,
+                &point_ptr as *const _ as *mut _,
+                &out_ptr as *const _ as *mut _,
+                &n_samples as *const _ as *mut _,
+                &full_leaf_base_width as *const _ as *mut _,
+                &n_coords as *const _ as *mut _,
+                &is_extension_u32 as *const _ as *mut _,
+            ];
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_eval_rows,
+                    (n_samples, 1, 1),
+                    (1, 1, 1),
+                    (shared_words * std::mem::size_of::<u32>()) as u32,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("merkle eval rows kernel failed");
+            }
+        }
+    }
+
+    pub fn gather_rows_device(
+        &self,
+        d_leaf_matrix: &CudaSlice<u32>,
+        d_indices: &CudaSlice<u32>,
+        n_samples: u32,
+        row_width: u32,
+    ) -> CudaSlice<u32> {
+        let d_out = self.gather_rows_device_async(d_leaf_matrix, d_indices, n_samples, row_width);
+        self.stream.synchronize().unwrap();
+        d_out
+    }
+
+    pub fn gather_rows_device_async(
+        &self,
+        d_leaf_matrix: &CudaSlice<u32>,
+        d_indices: &CudaSlice<u32>,
+        n_samples: u32,
+        row_width: u32,
+    ) -> CudaSlice<u32> {
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<u32>((n_samples as usize) * (row_width as usize))
+            .unwrap();
+        self.gather_rows_device_into_async(
+            d_leaf_matrix,
+            d_indices,
+            n_samples,
+            row_width,
+            &mut d_out,
+        );
+        d_out
+    }
+
+    pub fn gather_rows_device_into_async(
+        &self,
+        d_leaf_matrix: &CudaSlice<u32>,
+        d_indices: &CudaSlice<u32>,
+        n_samples: u32,
+        row_width: u32,
+        d_out: &mut CudaSlice<u32>,
+    ) {
+        assert!(d_out.len() >= (n_samples as usize) * (row_width as usize));
+        if n_samples == 0 || row_width == 0 {
+            return;
+        }
+        {
+            let (leaf_ptr, _g1) = d_leaf_matrix.device_ptr(&self.stream);
+            let (idx_ptr, _g2) = d_indices.device_ptr(&self.stream);
+            let (out_ptr, _g3) = d_out.device_ptr_mut(&self.stream);
+            let threads = 256u32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &leaf_ptr as *const _ as *mut _,
+                &idx_ptr as *const _ as *mut _,
+                &out_ptr as *const _ as *mut _,
+                &n_samples as *const _ as *mut _,
+                &row_width as *const _ as *mut _,
+            ];
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_gather_rows,
+                    (n_samples, 1, 1),
+                    (threads, 1, 1),
+                    0,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("merkle gather rows kernel failed");
+            }
+        }
+    }
+
+    pub fn gather_sibling_hashes_device(
+        &self,
+        d_layer: &CudaSlice<u32>,
+        d_indices: &CudaSlice<u32>,
+        n_samples: u32,
+        level: u32,
+    ) -> CudaSlice<u32> {
+        let d_out = self.gather_sibling_hashes_device_async(d_layer, d_indices, n_samples, level);
+        self.stream.synchronize().unwrap();
+        d_out
+    }
+
+    pub fn gather_sibling_hashes_device_async(
+        &self,
+        d_layer: &CudaSlice<u32>,
+        d_indices: &CudaSlice<u32>,
+        n_samples: u32,
+        level: u32,
+    ) -> CudaSlice<u32> {
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<u32>((n_samples as usize) * DIGEST_ELEMS)
+            .unwrap();
+        self.gather_sibling_hashes_device_into_async(
+            d_layer, d_indices, n_samples, level, &mut d_out,
+        );
+        d_out
+    }
+
+    pub fn gather_sibling_hashes_device_into_async(
+        &self,
+        d_layer: &CudaSlice<u32>,
+        d_indices: &CudaSlice<u32>,
+        n_samples: u32,
+        level: u32,
+        d_out: &mut CudaSlice<u32>,
+    ) {
+        assert!(d_out.len() >= (n_samples as usize) * DIGEST_ELEMS);
+        if n_samples == 0 {
+            return;
+        }
+        {
+            let (layer_ptr, _g1) = d_layer.device_ptr(&self.stream);
+            let (idx_ptr, _g2) = d_indices.device_ptr(&self.stream);
+            let (out_ptr, _g3) = d_out.device_ptr_mut(&self.stream);
+            let threads = 32u32;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &layer_ptr as *const _ as *mut _,
+                &idx_ptr as *const _ as *mut _,
+                &out_ptr as *const _ as *mut _,
+                &n_samples as *const _ as *mut _,
+                &level as *const _ as *mut _,
+            ];
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_gather_siblings,
+                    (n_samples, 1, 1),
+                    (threads, 1, 1),
+                    0,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("merkle gather sibling hashes kernel failed");
+            }
+        }
+    }
+
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
 }
 
 // ── CPU reference ────────────────────────────────────────────────────────
@@ -375,6 +771,9 @@ mod tests {
         let parent = cpu_compress_pair(&left, &right);
         // Should match: Poseidon16_compress([0;16])[0..8]
         let digest2 = cpu_leaf_hash(&[0u32; 16]);
-        assert_eq!(parent, digest2, "compress_pair([0;8],[0;8]) should equal leaf_hash([0;16])");
+        assert_eq!(
+            parent, digest2,
+            "compress_pair([0;8],[0;8]) should equal leaf_hash([0;16])"
+        );
     }
 }

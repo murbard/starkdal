@@ -6,8 +6,8 @@
 //!
 //! This handles ~60% of the proving time.
 
-use std::sync::Arc;
 use cudarc::driver::safe::{CudaSlice, CudaStream};
+use std::sync::Arc;
 
 use crate::GpuProverContext;
 
@@ -55,22 +55,22 @@ impl GpuWhirProtocol {
         stacked_n_vars: usize,
         folding_factor: usize,
         log_inv_rate: usize,
-        ood_points: &[Vec<[u32; 5]>],  // extension field points for OOD evaluation
+        ood_points: &[Vec<[u32; 5]>], // extension field points for OOD evaluation
     ) -> (Vec<u32>, Vec<[u32; 5]>, Vec<Vec<u32>>, Vec<u32>) {
         let n_evals = 1u32 << stacked_n_vars;
         let n_cols = 1u32 << folding_factor;
 
         // Reorder + DFT on device.
-        let d_dft = gpu.ntt.reorder_and_dft_device(
-            d_stacked, n_evals, folding_factor, log_inv_rate,
-        );
+        let d_dft =
+            gpu.ntt
+                .reorder_and_dft_device(d_stacked, n_evals, folding_factor, log_inv_rate);
 
         // Merkle tree on device (chained from DFT output).
         let full_len = (n_evals as u64) << log_inv_rate;
         let height = (full_len / n_cols as u64) as u32;
-        let (root, layers) = gpu.merkle.build_tree_from_device(
-            &d_dft, height, n_cols, n_cols,
-        );
+        let (root, layers) = gpu
+            .merkle
+            .build_tree_from_device(&d_dft, height, n_cols, n_cols);
 
         // Download DFT output for OOD evaluation + Merkle path opening.
         let dft_flat = gpu.stream.memcpy_dtov(&d_dft).unwrap();
@@ -98,22 +98,32 @@ impl GpuWhirProtocol {
         folding_factor: usize,
         log_inv_rate: usize,
         // Callbacks for Fiat-Shamir interaction:
-        on_root: &mut dyn FnMut(&[u32]),  // called with Merkle root
-        on_ood: &mut dyn FnMut(&[[u32; 5]]) -> Vec<[u32; 5]>,  // OOD points → answers
-        on_pow: &mut dyn FnMut(),  // PoW grinding
-        on_queries: &mut dyn FnMut() -> Vec<usize>,  // query sampling
-        on_eq_update: &mut dyn FnMut(&mut CudaSlice<u32>, usize),  // eq accumulation
-        on_sumcheck_round: &mut dyn FnMut([u32; 5], [u32; 5]) -> [u32; 5],  // per-fold callback
-    ) -> (CudaSlice<u32>, CudaSlice<u32>, usize, Vec<Vec<u32>>, Vec<u32>) {
+        on_root: &mut dyn FnMut(&[u32]), // called with Merkle root
+        on_ood: &mut dyn FnMut(&[[u32; 5]]) -> Vec<[u32; 5]>, // OOD points → answers
+        on_pow: &mut dyn FnMut(),        // PoW grinding
+        on_queries: &mut dyn FnMut() -> Vec<usize>, // query sampling
+        on_eq_update: &mut dyn FnMut(&mut CudaSlice<u32>, usize), // eq accumulation
+        on_sumcheck_round: &mut dyn FnMut([u32; 5], [u32; 5]) -> [u32; 5], // per-fold callback
+    ) -> (
+        CudaSlice<u32>,
+        CudaSlice<u32>,
+        usize,
+        Vec<Vec<u32>>,
+        Vec<u32>,
+    ) {
         let n_cols = 1u32 << folding_factor;
 
         // DFT on current evaluations.
-        let d_dft = gpu.ntt.reorder_and_dft_device(d_evals, n_evals as u32, folding_factor, log_inv_rate);
+        let d_dft =
+            gpu.ntt
+                .reorder_and_dft_device(d_evals, n_evals as u32, folding_factor, log_inv_rate);
 
         // Merkle tree.
         let full_len = (n_evals as u64) << log_inv_rate;
         let height = (full_len / n_cols as u64) as u32;
-        let (root, layers) = gpu.merkle.build_tree_from_device(&d_dft, height, n_cols, n_cols);
+        let (root, layers) = gpu
+            .merkle
+            .build_tree_from_device(&d_dft, height, n_cols, n_cols);
         let dft_flat = gpu.stream.memcpy_dtov(&d_dft).unwrap();
 
         on_root(&root);
@@ -124,9 +134,21 @@ impl GpuWhirProtocol {
         // For now, return the current state unchanged.
         // The full implementation will perform all operations on device.
 
-        let d_evals_clone = gpu.stream.memcpy_stod(&gpu.stream.memcpy_dtov(d_evals).unwrap()).unwrap();
-        let d_weights_clone = gpu.stream.memcpy_stod(&gpu.stream.memcpy_dtov(d_weights).unwrap()).unwrap();
+        let d_evals_clone = gpu
+            .stream
+            .memcpy_stod(&gpu.stream.memcpy_dtov(d_evals).unwrap())
+            .unwrap();
+        let d_weights_clone = gpu
+            .stream
+            .memcpy_stod(&gpu.stream.memcpy_dtov(d_weights).unwrap())
+            .unwrap();
 
-        (d_evals_clone, d_weights_clone, n_evals / (1 << folding_factor), layers, dft_flat)
+        (
+            d_evals_clone,
+            d_weights_clone,
+            n_evals / (1 << folding_factor),
+            layers,
+            dft_flat,
+        )
     }
 }

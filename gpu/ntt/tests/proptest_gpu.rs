@@ -2,10 +2,10 @@
 
 use std::sync::Arc;
 
-use koala_bear::KoalaBear;
 use cudarc::driver::safe::CudaContext;
 use field::{PrimeCharacteristicRing, PrimeField32};
 use gpu_ntt::*;
+use koala_bear::KoalaBear;
 use proptest::prelude::*;
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
@@ -151,7 +151,10 @@ fn test_dft_all_zeros() {
     let data = vec![0u32; 1 << log_n];
     let gpu_out = g.dft(&data, log_n, 1);
     // DFT of all zeros should be all zeros.
-    assert!(gpu_out.iter().all(|&v| v == 0), "DFT of zeros should be zeros");
+    assert!(
+        gpu_out.iter().all(|&v| v == 0),
+        "DFT of zeros should be zeros"
+    );
 }
 
 #[test]

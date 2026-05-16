@@ -29,7 +29,8 @@ __device__ void quintic_mul_air(const uint32_t a[5], const uint32_t b[5], uint32
 __device__ void eval_extension_op_air(
     const uint32_t up[29],
     const uint32_t down[13],  // start_down, is_be_down, len_down, flag_add_down, flag_mul_down, flag_peq_down, idx_a_down, idx_b_down, comp_down[5]
-    uint32_t constraints[33]  // output: 33 constraint values
+    uint32_t constraints[33],  // output: 33 constraint values
+    uint32_t* bus_data = nullptr  // optional: [0]=activation_flag, [1]=aux, [2]=idx_a, [3]=idx_b, [4]=idx_r
 ) {
     uint32_t ONE = KB_MONTY_ONE;
     // DIMENSION = 5
@@ -74,11 +75,11 @@ __device__ void eval_extension_op_air(
     int ci = 0;
 
     // Boolean constraints (5)
-    constraints[ci++] = kb_mul(is_be, kb_sub(is_be, ONE));
-    constraints[ci++] = kb_mul(start, kb_sub(start, ONE));
-    constraints[ci++] = kb_mul(flag_add, kb_sub(flag_add, ONE));
-    constraints[ci++] = kb_mul(flag_mul, kb_sub(flag_mul, ONE));
-    constraints[ci++] = kb_mul(flag_peq, kb_sub(flag_peq, ONE));
+    constraints[ci++] = kb_mul(is_be, kb_sub(ONE, is_be));
+    constraints[ci++] = kb_mul(start, kb_sub(ONE, start));
+    constraints[ci++] = kb_mul(flag_add, kb_sub(ONE, flag_add));
+    constraints[ci++] = kb_mul(flag_mul, kb_sub(ONE, flag_mul));
+    constraints[ci++] = kb_mul(flag_peq, kb_sub(ONE, flag_peq));
 
     // Add constraints (5): (comp[k] - (va_f_or_ef[k] + vb[k] + comp_tail[k])) * flag_add
     for (int k = 0; k < 5; k++) {
@@ -115,7 +116,7 @@ __device__ void eval_extension_op_air(
     }
 
     // Counter/index constraints (8)
-    constraints[ci++] = kb_mul(not_start_down, kb_sub(len, kb_sub(len_down, ONE))); // len - len_down - 1
+    constraints[ci++] = kb_mul(not_start_down, kb_sub(kb_sub(len, len_down), ONE)); // (len - len_down) - 1
     constraints[ci++] = kb_mul(not_start_down, kb_sub(is_be, is_be_down));
     constraints[ci++] = kb_mul(not_start_down, kb_sub(flag_add, flag_add_down));
     constraints[ci++] = kb_mul(not_start_down, kb_sub(flag_mul, flag_mul_down));
@@ -127,6 +128,24 @@ __device__ void eval_extension_op_air(
 
     // Last constraint: start_down * (len - 1)
     constraints[ci++] = kb_mul(start_down, kb_sub(len, ONE));
+    // ci == 33
 
-    // ci should be 33
+
+
+    // Bus data output for bus constraint computation.
+    if (bus_data) {
+        uint32_t active = kb_add(kb_add(flag_add, flag_mul), flag_peq);
+        uint32_t activation_flag = kb_mul(start, active);
+        // aux = is_be*4 + flag_add*8 + flag_mul*16 + flag_poly_eq*32 + len*64
+        uint32_t FOUR = kb_to_monty(4), EIGHT = kb_to_monty(8);
+        uint32_t SIXTEEN = kb_to_monty(16), THIRTYTWO = kb_to_monty(32), SIXTYFOUR = kb_to_monty(64);
+        uint32_t aux = kb_add(kb_add(kb_add(kb_mul(is_be, FOUR), kb_mul(flag_add, EIGHT)),
+                      kb_add(kb_mul(flag_mul, SIXTEEN), kb_mul(flag_peq, THIRTYTWO))),
+                      kb_mul(len, SIXTYFOUR));
+        bus_data[0] = activation_flag;
+        bus_data[1] = aux;
+        bus_data[2] = up[EO_COL_IDX_A];
+        bus_data[3] = up[EO_COL_IDX_B];
+        bus_data[4] = up[EO_COL_IDX_RES];
+    }
 }

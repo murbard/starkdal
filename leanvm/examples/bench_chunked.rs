@@ -60,7 +60,9 @@ fn generate_shared_chunk_program(cp: &CircuitParams, chunk_size: usize) -> Strin
         for c in 1..chunk_n_chunks_per_leaf {
             p.push_str(&format!(
                 "    poseidon16_compress(chain + {}, V + {}, chain + {})\n",
-                ch + (c - 1) * DIGEST_LEN, ld + c * 8, ch + c * DIGEST_LEN,
+                ch + (c - 1) * DIGEST_LEN,
+                ld + c * 8,
+                ch + c * DIGEST_LEN,
             ));
         }
         let final_ch = ch + (chunk_n_chunks_per_leaf - 1) * DIGEST_LEN;
@@ -110,7 +112,9 @@ fn generate_shared_chunk_program(cp: &CircuitParams, chunk_size: usize) -> Strin
         p.push_str(&format!("        yj_n_inv_{i} = 1 / (G_N * sign_{i})\n"));
         p.push_str(&format!("        numer_{i} = bn_{i} * yj_n_inv_{i} - 1\n"));
         p.push_str(&format!("        denom_{i} = beta_{i} - x_{i}\n"));
-        p.push_str(&format!("        s_{i} = s_{i} + V[j_{i}] * w_{i} * numer_{i} / denom_{i}\n"));
+        p.push_str(&format!(
+            "        s_{i} = s_{i} + V[j_{i}] * w_{i} * numer_{i} / denom_{i}\n"
+        ));
         p.push_str(&format!("        x_{i} = x_{i} * OMEGA\n"));
         p.push_str(&format!("        w_{i} = w_{i} * OMEGA_1MN\n"));
         p.push_str(&format!("        sign_{i} = 0 - sign_{i}\n"));
@@ -143,12 +147,21 @@ fn make_chunk_pi(chunk: &ChunkData, challenges: &[F]) -> Vec<F> {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let log_n: usize = args.iter().position(|a| a == "--log-n")
-        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(22);
-    let log_chunk: usize = args.iter().position(|a| a == "--log-chunk")
-        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(12);
-    let concurrency: usize = args.iter().position(|a| a == "--concurrency")
-        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(0); // 0 = auto (rayon default)
+    let log_n: usize = args
+        .iter()
+        .position(|a| a == "--log-n")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(22);
+    let log_chunk: usize = args
+        .iter()
+        .position(|a| a == "--log-chunk")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(12);
+    let concurrency: usize = args
+        .iter()
+        .position(|a| a == "--concurrency")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(0); // 0 = auto (rayon default)
     let log_blowup = 1usize;
     let log_total = log_n + log_blowup;
     let lfpl = pick_log_felts_per_leaf_kb(log_total);
@@ -169,7 +182,14 @@ fn main() {
     eprintln!("  chunk_size  = {chunk_size} (log_chunk={log_chunk})");
     eprintln!("  n_chunks    = {n_chunks}");
     eprintln!("  cores       = {n_cores}");
-    eprintln!("  concurrency = {}", if concurrency == 0 { "auto".to_string() } else { concurrency.to_string() });
+    eprintln!(
+        "  concurrency = {}",
+        if concurrency == 0 {
+            "auto".to_string()
+        } else {
+            concurrency.to_string()
+        }
+    );
     eprintln!();
 
     // 1. Reference computation
@@ -222,7 +242,14 @@ fn main() {
                     s
                 })
                 .collect();
-            ChunkData { subtree_root, partial_sums, x_start, w_start, sign_start, evals: chunk_evals }
+            ChunkData {
+                subtree_root,
+                partial_sums,
+                x_start,
+                w_start,
+                sign_start,
+                evals: chunk_evals,
+            }
         })
         .collect();
     let ref_time = t0.elapsed();
@@ -238,7 +265,11 @@ fn main() {
     let program = generate_shared_chunk_program(&cp, chunk_size);
     let bytecode = compile_program(&ProgramSource::Raw(program.clone()));
     let compile_time = t0.elapsed();
-    eprintln!("[2/4] Compiled: {} lines, {:.3}s", program.lines().count(), compile_time.as_secs_f64());
+    eprintln!(
+        "[2/4] Compiled: {} lines, {:.3}s",
+        program.lines().count(),
+        compile_time.as_secs_f64()
+    );
 
     // 3. Prove chunks with controlled concurrency
     let batch_size = if concurrency == 0 { n_chunks } else { concurrency };
@@ -254,10 +285,16 @@ fn main() {
                 let mut hints = HashMap::new();
                 hints.insert("evals_chunk".to_string(), vec![chunks[ci].evals.clone()]);
                 prove_execution(
-                    &bytecode, &pi,
-                    &ExecutionWitness { preamble_memory_len: 0, hints },
-                    &default_whir_config(1), false,
-                ).unwrap_or_else(|e| panic!("chunk {ci} failed: {e}"))
+                    &bytecode,
+                    &pi,
+                    &ExecutionWitness {
+                        preamble_memory_len: 0,
+                        hints,
+                    },
+                    &default_whir_config(1),
+                    false,
+                )
+                .unwrap_or_else(|e| panic!("chunk {ci} failed: {e}"))
             })
             .collect();
         proofs.extend(batch_proofs);
@@ -274,8 +311,7 @@ fn main() {
     let t0 = Instant::now();
     for ci in 0..n_verify {
         let pi = make_chunk_pi(&chunks[ci], &challenges);
-        verify_execution(&bytecode, &pi, proofs[ci].proof.clone())
-            .unwrap_or_else(|e| panic!("chunk {ci} verify: {e}"));
+        verify_execution(&bytecode, &pi, proofs[ci].proof.clone()).unwrap_or_else(|e| panic!("chunk {ci} verify: {e}"));
     }
     let verify_time = t0.elapsed();
     eprintln!("  {:.3}s", verify_time.as_secs_f64());
@@ -286,19 +322,26 @@ fn main() {
     eprintln!("------------------------------------------------------------");
     eprintln!("  Payload         : {:.1} MB", payload_mb);
     eprintln!("  Compile (once)  : {:.3}s", compile_time.as_secs_f64());
-    eprintln!("  Prove (parallel): {:.3}s on {} cores", prove_time.as_secs_f64(), n_cores);
+    eprintln!(
+        "  Prove (parallel): {:.3}s on {} cores",
+        prove_time.as_secs_f64(),
+        n_cores
+    );
     eprintln!("  Peak RSS        : {:.1} GB", peak_rss as f64 / (1u64 << 30) as f64);
     eprintln!("  Total cycles    : {total_cycles}");
     eprintln!("------------------------------------------------------------");
 
-    println!("{}", serde_json::json!({
-        "payload_mb": (payload_mb * 10.0).round() / 10.0,
-        "log_n": log_n, "log_chunk": log_chunk, "n_chunks": n_chunks,
-        "cores": n_cores,
-        "compile_s": (compile_time.as_secs_f64() * 1000.0).round() / 1000.0,
-        "prove_s": (prove_time.as_secs_f64() * 1000.0).round() / 1000.0,
-        "ref_s": (ref_time.as_secs_f64() * 1000.0).round() / 1000.0,
-        "total_cycles": total_cycles, "total_poseidons": total_poseidons,
-        "peak_rss": peak_rss,
-    }));
+    println!(
+        "{}",
+        serde_json::json!({
+            "payload_mb": (payload_mb * 10.0).round() / 10.0,
+            "log_n": log_n, "log_chunk": log_chunk, "n_chunks": n_chunks,
+            "cores": n_cores,
+            "compile_s": (compile_time.as_secs_f64() * 1000.0).round() / 1000.0,
+            "prove_s": (prove_time.as_secs_f64() * 1000.0).round() / 1000.0,
+            "ref_s": (ref_time.as_secs_f64() * 1000.0).round() / 1000.0,
+            "total_cycles": total_cycles, "total_poseidons": total_poseidons,
+            "peak_rss": peak_rss,
+        })
+    );
 }

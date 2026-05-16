@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use cudarc::driver::safe::CudaStream;
+use gpu_poly_fold::{FoldMode, GpuPolyFold};
 use gpu_sumcheck::GpuSumcheck;
-use gpu_poly_fold::{GpuPolyFold, FoldMode};
 
 /// Run a full product sumcheck on GPU.
 ///

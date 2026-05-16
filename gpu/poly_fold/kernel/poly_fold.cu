@@ -244,3 +244,89 @@ extern "C" __global__ void fold_ext_at_bit_kernel(
     qe_mul(r, diff, prod);
     qe_add(lo, prod, output + j * 5);
 }
+
+// ── Multilinear evals -> coeffs transform for extension field ────────────
+// Matches backend/poly::evals_to_coeffs:
+// 1. For half = 1,2,4,...: data[i+half] -= data[i] within each 2*half block.
+// 2. Bit-reverse the resulting coefficient vector.
+
+extern "C" __global__ void evals_to_coeffs_ext_first_layer_kernel(
+    const uint32_t* __restrict__ input, // n_elements * 5 elements
+    uint32_t* __restrict__ data,        // n_elements * 5 elements
+    uint32_t n_elements
+) {
+    uint32_t pair = blockIdx.x * blockDim.x + threadIdx.x;
+    if (n_elements == 1) {
+        if (pair == 0) {
+            #pragma unroll
+            for (int k = 0; k < 5; k++) {
+                data[k] = input[k];
+            }
+        }
+        return;
+    }
+
+    uint32_t n_pairs = n_elements >> 1;
+    if (pair >= n_pairs) return;
+
+    uint32_t i0 = pair << 1;
+    uint32_t i1 = i0 + 1;
+    uint32_t lo[5], hi[5], out[5];
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+        lo[k] = input[i0 * 5 + k];
+        hi[k] = input[i1 * 5 + k];
+        data[i0 * 5 + k] = lo[k];
+    }
+    qe_sub(hi, lo, out);
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+        data[i1 * 5 + k] = out[k];
+    }
+}
+
+extern "C" __global__ void evals_to_coeffs_ext_layer_kernel(
+    uint32_t* __restrict__ data,   // n_elements * 5 elements
+    uint32_t half,
+    uint32_t n_elements
+) {
+    uint32_t pair = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t n_pairs = n_elements >> 1;
+    if (pair >= n_pairs) return;
+
+    uint32_t block = pair / half;
+    uint32_t offset = pair % half;
+    uint32_t i0 = block * (half << 1) + offset;
+    uint32_t i1 = i0 + half;
+
+    uint32_t lo[5], hi[5], out[5];
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+        lo[k] = data[i0 * 5 + k];
+        hi[k] = data[i1 * 5 + k];
+    }
+    qe_sub(hi, lo, out);
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+        data[i1 * 5 + k] = out[k];
+    }
+}
+
+extern "C" __global__ void bit_reverse_ext_kernel(
+    uint32_t* __restrict__ data,   // n_elements * 5 elements
+    uint32_t log_n,
+    uint32_t n_elements
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_elements) return;
+
+    uint32_t j = __brev(i) >> (32 - log_n);
+    if (i >= j) return;
+
+    #pragma unroll
+    for (int k = 0; k < 5; k++) {
+        uint32_t tmp = data[i * 5 + k];
+        data[i * 5 + k] = data[j * 5 + k];
+        data[j * 5 + k] = tmp;
+    }
+}

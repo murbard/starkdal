@@ -117,37 +117,42 @@ __device__ void poseidon16_compress(const uint32_t input[16], uint32_t output[8]
 // A valid nonce produces output[0] whose canonical value has >= target_bits
 // trailing zero bits.
 extern "C" __global__ void pow_grind_kernel(
-    const uint32_t* __restrict__ challenger_state,  // 16 elements
+    const uint32_t* __restrict__ challenger_state,  // prefix of length challenger_state_len
     uint32_t* __restrict__ found_nonce,              // output: winning nonce (monty form)
     uint32_t* __restrict__ found_flag,               // atomic: set to 1 when found
+    uint32_t challenger_state_len,
     uint32_t target_bits,
     uint32_t nonce_slot,                             // which state slot to place nonce
-    uint64_t batch_offset                            // starting nonce for this launch
+    uint64_t max_nonces                              // search space upper bound (exclusive)
 ) {
-    if (*found_flag) return;  // early exit if another thread already found it
-
     uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    uint64_t nonce_val = batch_offset + tid;
+    uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+    uint32_t mask = (target_bits >= 32) ? 0xFFFFFFFFu : ((1u << target_bits) - 1u);
 
-    // Build input state: copy challenger state, insert nonce.
-    uint32_t input[16];
-    #pragma unroll
-    for (int i = 0; i < 16; i++) input[i] = challenger_state[i];
+    for (uint64_t nonce_val = tid; nonce_val < max_nonces; nonce_val += stride) {
+        if (*found_flag) return;
 
-    // Convert nonce to Montgomery form and place in designated slot.
-    input[nonce_slot] = kb_to_monty((uint32_t)(nonce_val & 0x7FFFFFFFu));
+        // Build input state: copy challenger state, insert nonce.
+        uint32_t input[16];
+        #pragma unroll
+        for (int i = 0; i < 16; i++) {
+            input[i] = (i < challenger_state_len) ? challenger_state[i] : 0u;
+        }
 
-    // Compress.
-    uint32_t output[8];
-    poseidon16_compress(input, output);
+        // Convert nonce to Montgomery form and place in designated slot.
+        input[nonce_slot] = kb_to_monty((uint32_t)(nonce_val & 0x7FFFFFFFu));
 
-    // Check trailing zero bits of canonical output[0].
-    uint32_t canonical = kb_from_monty(output[0]);
-    uint32_t mask = (1u << target_bits) - 1u;
-    if ((canonical & mask) == 0) {
-        // Atomically claim the win.
-        if (atomicCAS(found_flag, 0u, 1u) == 0u) {
-            *found_nonce = input[nonce_slot];  // store in monty form
+        // Compress.
+        uint32_t output[8];
+        poseidon16_compress(input, output);
+
+        // Check trailing zero bits of canonical output[0].
+        uint32_t canonical = kb_from_monty(output[0]);
+        if ((canonical & mask) == 0) {
+            if (atomicCAS(found_flag, 0u, 1u) == 0u) {
+                *found_nonce = input[nonce_slot];  // store in monty form
+            }
+            return;
         }
     }
 }

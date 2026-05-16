@@ -9,11 +9,11 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+pub use backend::Proof;
 pub use backend::*;
 pub use lean_compiler::*;
-pub use lean_prover::prove_execution::{prove_execution, ExecutionProof};
+pub use lean_prover::prove_execution::{ExecutionProof, prove_execution};
 pub use lean_prover::verify_execution::verify_execution;
-pub use backend::Proof;
 pub use lean_prover::*;
 pub use lean_vm::*;
 pub use utils::poseidon16_compress;
@@ -26,24 +26,34 @@ pub const NUM_SYNDROME_CHECKS: usize = 4;
 // ── Field helpers ──────────────────────────────────────────────────────────
 
 pub fn get_omega(log_order: usize) -> F {
-    assert!(log_order <= TWO_ADICITY, "log_order {log_order} exceeds KoalaBear 2-adicity {TWO_ADICITY}");
+    assert!(
+        log_order <= TWO_ADICITY,
+        "log_order {log_order} exceeds KoalaBear 2-adicity {TWO_ADICITY}"
+    );
     F::from_u32(3).exp_u64((P - 1) >> log_order)
 }
 
 pub fn bit_reverse(x: usize, bits: usize) -> usize {
     let mut r = 0;
     let mut v = x;
-    for _ in 0..bits { r = (r << 1) | (v & 1); v >>= 1; }
+    for _ in 0..bits {
+        r = (r << 1) | (v & 1);
+        v >>= 1;
+    }
     r
 }
 
 pub fn pick_log_felts_per_leaf_kb(log_total: usize) -> usize {
     let mut k = 3usize;
-    while (1usize << k.saturating_sub(3)) + k < log_total { k += 1; }
+    while (1usize << k.saturating_sub(3)) + k < log_total {
+        k += 1;
+    }
     k
 }
 
-pub fn fmt_f(f: F) -> String { format!("{}", f.as_canonical_u32()) }
+pub fn fmt_f(f: F) -> String {
+    format!("{}", f.as_canonical_u32())
+}
 
 // ── Circuit parameters ────────────────────────────────────────────────────
 
@@ -88,25 +98,49 @@ impl CircuitParams {
 
         let mut twiddles = Vec::with_capacity(n_eval / 2);
         let mut acc = F::ONE;
-        for _ in 0..n_eval / 2 { twiddles.push(acc); acc *= omega; }
+        for _ in 0..n_eval / 2 {
+            twiddles.push(acc);
+            acc *= omega;
+        }
 
         let bit_rev_table: Vec<usize> = (0..n_eval).map(|i| bit_reverse(i, log_total)).collect();
 
         let mut g_powers = Vec::with_capacity(n);
         let mut gp = F::ONE;
-        for _ in 0..n { g_powers.push(gp); gp *= g; }
+        for _ in 0..n {
+            g_powers.push(gp);
+            gp *= g;
+        }
 
         let mut layer_offsets = vec![0usize];
         let mut acc_off = 0;
-        for k in 0..tree_depth { acc_off += (n_leaves >> k) * DIGEST_LEN; layer_offsets.push(acc_off); }
+        for k in 0..tree_depth {
+            acc_off += (n_leaves >> k) * DIGEST_LEN;
+            layer_offsets.push(acc_off);
+        }
         let total_tree_size = acc_off + DIGEST_LEN;
 
         Self {
-            log_n, log_blowup, log_total, log_felts_per_leaf,
-            n, n_eval, fpl, n_leaves, tree_depth, n_chunks_per_leaf,
-            omega, g, g_n, g_1mn, omega_1mn,
-            twiddles, bit_rev: bit_rev_table, g_powers,
-            layer_offsets, total_tree_size,
+            log_n,
+            log_blowup,
+            log_total,
+            log_felts_per_leaf,
+            n,
+            n_eval,
+            fpl,
+            n_leaves,
+            tree_depth,
+            n_chunks_per_leaf,
+            omega,
+            g,
+            g_n,
+            g_1mn,
+            omega_1mn,
+            twiddles,
+            bit_rev: bit_rev_table,
+            g_powers,
+            layer_offsets,
+            total_tree_size,
         }
     }
 }
@@ -116,10 +150,15 @@ impl CircuitParams {
 pub fn reference_coset_fft(cp: &CircuitParams, coeffs: &[F]) -> Vec<F> {
     let mut data = vec![F::ZERO; cp.n_eval];
     let mut g_pow = F::ONE;
-    for i in 0..cp.n { data[i] = coeffs[i] * g_pow; g_pow *= cp.g; }
+    for i in 0..cp.n {
+        data[i] = coeffs[i] * g_pow;
+        g_pow *= cp.g;
+    }
     for i in 0..cp.n_eval {
         let j = bit_reverse(i, cp.log_total);
-        if i < j { data.swap(i, j); }
+        if i < j {
+            data.swap(i, j);
+        }
     }
     for s in 1..=cp.log_total {
         let m = 1 << s;
@@ -204,11 +243,15 @@ pub fn emit_merkle_tree(p: &mut String, cp: &CircuitParams, data_src_name: &str)
     for leaf in 0..cp.n_leaves {
         let ld = leaf * cp.fpl;
         let ch = leaf * cp.n_chunks_per_leaf * DIGEST_LEN;
-        p.push_str(&format!("    poseidon16_compress(zero_vec, {data_src_name} + {ld}, chain + {ch})\n"));
+        p.push_str(&format!(
+            "    poseidon16_compress(zero_vec, {data_src_name} + {ld}, chain + {ch})\n"
+        ));
         for c in 1..cp.n_chunks_per_leaf {
             p.push_str(&format!(
                 "    poseidon16_compress(chain + {}, {data_src_name} + {}, chain + {})\n",
-                ch + (c - 1) * DIGEST_LEN, ld + c * 8, ch + c * DIGEST_LEN,
+                ch + (c - 1) * DIGEST_LEN,
+                ld + c * 8,
+                ch + c * DIGEST_LEN,
             ));
         }
         let final_ch = ch + (cp.n_chunks_per_leaf - 1) * DIGEST_LEN;
@@ -280,18 +323,31 @@ pub fn run_bench(
     eprintln!("leanVM bench: {label}");
     eprintln!("============================================================");
     eprintln!("  log_n={} n_eval={} n_leaves={}", cp.log_n, cp.n_eval, cp.n_leaves);
-    eprintln!("  program: {} lines, {:.1} KB",
-        program_str.lines().count(), program_str.len() as f64 / 1024.0);
+    eprintln!(
+        "  program: {} lines, {:.1} KB",
+        program_str.lines().count(),
+        program_str.len() as f64 / 1024.0
+    );
 
     let t0 = Instant::now();
     let bytecode = compile_program(&ProgramSource::Raw(program_str));
     eprintln!("  compiled in {:.3}s", t0.elapsed().as_secs_f64());
 
-    let witness = ExecutionWitness { preamble_memory_len: 0, hints };
+    let witness = ExecutionWitness {
+        preamble_memory_len: 0,
+        hints,
+    };
 
     eprintln!("  proving...");
     let t0 = Instant::now();
-    let proof = prove_execution(&bytecode, public_input, &witness, &default_whir_config(log_inv_rate), false).unwrap();
+    let proof = prove_execution(
+        &bytecode,
+        public_input,
+        &witness,
+        &default_whir_config(log_inv_rate),
+        false,
+    )
+    .unwrap();
     let prove_time = t0.elapsed();
 
     let metadata = proof.metadata;
@@ -301,12 +357,21 @@ pub fn run_bench(
 
     let peak_rss = system_info::peak_rss_bytes();
 
-    eprintln!("  prove: {:.3}s | verify: {:.3}s | cycles: {} | poseidons: {} | RSS: {:.2} GB",
-        prove_time.as_secs_f64(), verify_time.as_secs_f64(),
-        metadata.cycles, metadata.n_poseidons,
-        peak_rss as f64 / (1u64 << 30) as f64);
+    eprintln!(
+        "  prove: {:.3}s | verify: {:.3}s | cycles: {} | poseidons: {} | RSS: {:.2} GB",
+        prove_time.as_secs_f64(),
+        verify_time.as_secs_f64(),
+        metadata.cycles,
+        metadata.n_poseidons,
+        peak_rss as f64 / (1u64 << 30) as f64
+    );
 
-    BenchResult { prove_time, verify_time, metadata, peak_rss }
+    BenchResult {
+        prove_time,
+        verify_time,
+        metadata,
+        peak_rss,
+    }
 }
 
 pub fn make_public_input(root: &[F; 8]) -> Vec<F> {

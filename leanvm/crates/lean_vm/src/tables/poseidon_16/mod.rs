@@ -290,7 +290,7 @@ impl<const BUS: bool> Air for Poseidon16Precompile<BUS> {
         vec![]
     }
     fn n_constraints(&self) -> usize {
-        BUS as usize + 80
+        BUS as usize + 81
     }
     fn eval<AB: AirBuilder>(&self, builder: &mut AB, extra_data: &Self::ExtraData) {
         let cols: Poseidon1Cols16<AB::IF> = {

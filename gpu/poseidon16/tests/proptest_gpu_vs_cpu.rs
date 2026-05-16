@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use koala_bear::KoalaBear;
 use cudarc::driver::safe::CudaContext;
 use gpu_poseidon16::{GpuPoseidon16, cpu_compress, cpu_permute};
+use koala_bear::KoalaBear;
 use proptest::prelude::*;
 
 const P: u32 = 0x7F000001;
@@ -76,9 +76,7 @@ proptest! {
 fn test_known_vector_gpu() {
     let (stream, gpu) = gpu_context();
 
-    let input_kb = KoalaBear::new_array(
-        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    );
+    let input_kb = KoalaBear::new_array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
     let input_u32: [u32; 16] = unsafe { std::mem::transmute(input_kb) };
 
     let d_input = stream.memcpy_stod(&input_u32).unwrap();
@@ -108,11 +106,7 @@ fn test_known_vector_gpu() {
 fn test_edge_cases_gpu() {
     let (stream, gpu) = gpu_context();
 
-    let cases: Vec<[u32; 16]> = vec![
-        [0u32; 16],
-        [1u32; 16],
-        [P - 1; 16],
-    ];
+    let cases: Vec<[u32; 16]> = vec![[0u32; 16], [1u32; 16], [P - 1; 16]];
 
     for (idx, state) in cases.iter().enumerate() {
         let d_input = stream.memcpy_stod(state.as_slice()).unwrap();

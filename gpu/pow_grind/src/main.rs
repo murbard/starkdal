@@ -31,17 +31,27 @@ fn main() {
     let gpu = GpuPowGrinder::new(stream.clone());
 
     let t0 = Instant::now();
-    let gpu_nonce = gpu.grind(&state, nonce_slot, cli.bits, 1 << 28)
+    let gpu_nonce = gpu
+        .grind(&state, nonce_slot, cli.bits, 1 << 28)
         .expect("GPU failed to find nonce");
     let gpu_time = t0.elapsed();
-    println!("GPU: found nonce {gpu_nonce:#010x} in {:.3} ms", gpu_time.as_secs_f64() * 1e3);
+    println!(
+        "GPU: found nonce {gpu_nonce:#010x} in {:.3} ms",
+        gpu_time.as_secs_f64() * 1e3
+    );
 
     // CPU
     if cli.bench_cpu {
         let t0 = Instant::now();
         let cpu_nonce = cpu_pow_grind(&state, nonce_slot as usize, cli.bits);
         let cpu_time = t0.elapsed();
-        println!("CPU: found nonce {cpu_nonce:#010x} in {:.3} ms", cpu_time.as_secs_f64() * 1e3);
-        println!("Speedup: {:.1}x", cpu_time.as_secs_f64() / gpu_time.as_secs_f64());
+        println!(
+            "CPU: found nonce {cpu_nonce:#010x} in {:.3} ms",
+            cpu_time.as_secs_f64() * 1e3
+        );
+        println!(
+            "Speedup: {:.1}x",
+            cpu_time.as_secs_f64() / gpu_time.as_secs_f64()
+        );
     }
 }

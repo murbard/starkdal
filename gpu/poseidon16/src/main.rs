@@ -7,11 +7,11 @@
 
 use std::time::Instant;
 
-use koala_bear::{KoalaBear, default_koalabear_poseidon1_16};
-use koala_bear::symmetric::Permutation;
 use clap::Parser;
 use cudarc::driver::safe::CudaContext;
 use gpu_poseidon16::{GpuPoseidon16, cpu_compress};
+use koala_bear::symmetric::Permutation;
+use koala_bear::{KoalaBear, default_koalabear_poseidon1_16};
 use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 #[derive(Parser)]
@@ -120,8 +120,7 @@ fn main() {
             for j in 0..16 {
                 kb[j] += initial[j];
             }
-            let out: &[u32; 16] =
-                unsafe { &*(&*kb as *const [KoalaBear; 16] as *const [u32; 16]) };
+            let out: &[u32; 16] = unsafe { &*(&*kb as *const [KoalaBear; 16] as *const [u32; 16]) };
             cpu_output[i * 8..(i + 1) * 8].copy_from_slice(&out[..8]);
         }
         let cpu_elapsed = t0.elapsed().as_secs_f64();

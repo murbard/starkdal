@@ -14,6 +14,12 @@ pub mod prove_execution;
 pub mod verify_execution;
 
 #[cfg(feature = "gpu")]
+mod gpu_air;
+#[cfg(feature = "gpu")]
+mod gpu_gkr;
+#[cfg(feature = "gpu")]
+mod gpu_logup;
+#[cfg(feature = "gpu")]
 pub mod gpu_prove_execution;
 
 #[cfg(test)]
@@ -84,7 +90,6 @@ impl Display for ProverError {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {

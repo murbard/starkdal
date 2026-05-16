@@ -406,9 +406,15 @@ fn compile_dal_program(inner_log_size: usize, bytecode_zero_eval: F, max_childre
     // DAL-specific replacements
     replacements.insert("MAX_CHILDREN_PLACEHOLDER".to_string(), max_children.to_string());
     let bytecode_claim_offset = DIGEST_LEN + 4 + 1;
-    replacements.insert("BYTECODE_CLAIM_OFFSET_PLACEHOLDER".to_string(), bytecode_claim_offset.to_string());
+    replacements.insert(
+        "BYTECODE_CLAIM_OFFSET_PLACEHOLDER".to_string(),
+        bytecode_claim_offset.to_string(),
+    );
     let bytecode_hash_domsep_offset = bytecode_claim_offset + claim_data_size_padded;
-    replacements.insert("BYTECODE_HASH_DOMSEP_OFFSET_PLACEHOLDER".to_string(), bytecode_hash_domsep_offset.to_string());
+    replacements.insert(
+        "BYTECODE_HASH_DOMSEP_OFFSET_PLACEHOLDER".to_string(),
+        bytecode_hash_domsep_offset.to_string(),
+    );
 
     let filepath = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("dal_main.py")

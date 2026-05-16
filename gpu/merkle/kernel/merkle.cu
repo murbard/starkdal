@@ -180,3 +180,135 @@ extern "C" __global__ void merkle_reduce_kernel(
     #pragma unroll
     for (int i = 0; i < 8; i++) out[i] = state[i];
 }
+
+extern "C" __global__ void merkle_eval_rows_at_randomness_kernel(
+    const uint32_t* __restrict__ leaf_matrix, // height * full_leaf_base_width words
+    const uint32_t* __restrict__ indices,     // n_samples raw indices
+    const uint32_t* __restrict__ point_words, // n_coords * 5 ext coordinates
+    uint32_t* __restrict__ out,               // n_samples * 5 ext outputs
+    uint32_t n_samples,
+    uint32_t full_leaf_base_width,
+    uint32_t n_coords,
+    uint32_t is_extension
+) {
+    uint32_t sample = blockIdx.x;
+    if (sample >= n_samples || threadIdx.x != 0) return;
+
+    extern __shared__ uint32_t scratch[];
+    uint32_t index = indices[sample];
+    const uint32_t* row = leaf_matrix + (uint64_t)index * full_leaf_base_width;
+
+    if (n_coords == 0) {
+        uint32_t* dst = out + sample * 5;
+        if (is_extension) {
+            #pragma unroll
+            for (int k = 0; k < 5; k++) dst[k] = row[k];
+        } else {
+            dst[0] = row[0];
+            #pragma unroll
+            for (int k = 1; k < 5; k++) dst[k] = 0;
+        }
+        return;
+    }
+
+    if (!is_extension) {
+        uint32_t current_len = full_leaf_base_width;
+        for (uint32_t i = 0; i < current_len; i++) scratch[i] = row[i];
+
+        uint32_t* current = scratch + full_leaf_base_width;
+        const uint32_t* r0 = point_words;
+        uint32_t n_pairs = current_len / 2;
+        for (uint32_t j = 0; j < n_pairs; j++) {
+            uint32_t lo = scratch[j];
+            uint32_t hi = scratch[j + n_pairs];
+            uint32_t diff = kb_sub(hi, lo);
+            uint32_t* dst = current + j * 5;
+            #pragma unroll
+            for (int k = 0; k < 5; k++) dst[k] = kb_mul(r0[k], diff);
+            dst[0] = kb_add(dst[0], lo);
+        }
+        current_len = n_pairs;
+
+        for (uint32_t coord = 1; coord < n_coords; coord++) {
+            const uint32_t* r = point_words + coord * 5;
+            n_pairs = current_len / 2;
+            for (uint32_t j = 0; j < n_pairs; j++) {
+                uint32_t* lo_ptr = current + j * 5;
+                uint32_t* hi_ptr = current + (j + n_pairs) * 5;
+                uint32_t lo[5], hi[5], diff[5], prod[5];
+                #pragma unroll
+                for (int k = 0; k < 5; k++) {
+                    lo[k] = lo_ptr[k];
+                    hi[k] = hi_ptr[k];
+                }
+                qe_sub(hi, lo, diff);
+                qe_mul(r, diff, prod);
+                qe_add(lo, prod, lo_ptr);
+            }
+            current_len = n_pairs;
+        }
+
+        uint32_t* dst = out + sample * 5;
+        #pragma unroll
+        for (int k = 0; k < 5; k++) dst[k] = current[k];
+        return;
+    }
+
+    uint32_t current_len = full_leaf_base_width / 5;
+    for (uint32_t i = 0; i < full_leaf_base_width; i++) scratch[i] = row[i];
+
+    for (uint32_t coord = 0; coord < n_coords; coord++) {
+        const uint32_t* r = point_words + coord * 5;
+        uint32_t n_pairs = current_len / 2;
+        for (uint32_t j = 0; j < n_pairs; j++) {
+            uint32_t* lo_ptr = scratch + j * 5;
+            uint32_t* hi_ptr = scratch + (j + n_pairs) * 5;
+            uint32_t lo[5], hi[5], diff[5], prod[5];
+            #pragma unroll
+            for (int k = 0; k < 5; k++) {
+                lo[k] = lo_ptr[k];
+                hi[k] = hi_ptr[k];
+            }
+            qe_sub(hi, lo, diff);
+            qe_mul(r, diff, prod);
+            qe_add(lo, prod, lo_ptr);
+        }
+        current_len = n_pairs;
+    }
+
+    uint32_t* dst = out + sample * 5;
+    #pragma unroll
+    for (int k = 0; k < 5; k++) dst[k] = scratch[k];
+}
+
+extern "C" __global__ void merkle_gather_rows_kernel(
+    const uint32_t* __restrict__ leaf_matrix,
+    const uint32_t* __restrict__ indices,
+    uint32_t* __restrict__ out,
+    uint32_t n_samples,
+    uint32_t row_width
+) {
+    uint32_t sample = blockIdx.x;
+    if (sample >= n_samples) return;
+
+    uint32_t index = indices[sample];
+    const uint32_t* row = leaf_matrix + (uint64_t)index * row_width;
+    uint32_t* dst = out + (uint64_t)sample * row_width;
+    for (uint32_t i = threadIdx.x; i < row_width; i += blockDim.x) {
+        dst[i] = row[i];
+    }
+}
+
+extern "C" __global__ void merkle_gather_sibling_hashes_kernel(
+    const uint32_t* __restrict__ layer,
+    const uint32_t* __restrict__ indices,
+    uint32_t* __restrict__ out,
+    uint32_t n_samples,
+    uint32_t level
+) {
+    uint32_t sample = blockIdx.x;
+    if (sample >= n_samples || threadIdx.x >= 8) return;
+
+    uint32_t sibling_index = (indices[sample] >> level) ^ 1u;
+    out[sample * 8 + threadIdx.x] = layer[(uint64_t)sibling_index * 8 + threadIdx.x];
+}

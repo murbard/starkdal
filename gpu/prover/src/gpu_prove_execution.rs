@@ -4,8 +4,8 @@
 //! Each function handles one protocol phase, operating on GPU-resident data.
 //! The top-level orchestration ties them together with ProverState on CPU.
 
-use std::sync::Arc;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use cudarc::driver::safe::{CudaSlice, CudaStream};
 
@@ -35,9 +35,8 @@ impl GpuTrace {
         memory: &[lean_vm::F],
         public_memory_size: usize,
     ) -> Self {
-        let mem_u32 = unsafe {
-            std::slice::from_raw_parts(memory.as_ptr().cast::<u32>(), memory.len())
-        };
+        let mem_u32 =
+            unsafe { std::slice::from_raw_parts(memory.as_ptr().cast::<u32>(), memory.len()) };
         let d_memory = stream.memcpy_stod(mem_u32).unwrap();
 
         let mut columns = BTreeMap::new();
@@ -48,9 +47,8 @@ impl GpuTrace {
             non_padded_rows.insert(*table, trace.non_padded_n_rows);
             let mut cols = Vec::new();
             for col in &trace.columns {
-                let u32s = unsafe {
-                    std::slice::from_raw_parts(col.as_ptr().cast::<u32>(), col.len())
-                };
+                let u32s =
+                    unsafe { std::slice::from_raw_parts(col.as_ptr().cast::<u32>(), col.len()) };
                 cols.push(stream.memcpy_stod(u32s).unwrap());
             }
             columns.insert(*table, cols);
@@ -83,14 +81,14 @@ pub fn gpu_whir_commit(
     log_inv_rate: usize,
 ) -> (Vec<u32>, Vec<u32>, Vec<Vec<u32>>) {
     let n_cols = 1u32 << folding_factor;
-    let d_dft = gpu.ntt.reorder_and_dft_device(
-        d_polynomial, n_evals as u32, folding_factor, log_inv_rate,
-    );
+    let d_dft =
+        gpu.ntt
+            .reorder_and_dft_device(d_polynomial, n_evals as u32, folding_factor, log_inv_rate);
     let full_len = (n_evals as u64) << log_inv_rate;
     let height = (full_len / n_cols as u64) as u32;
-    let (root, layers) = gpu.merkle.build_tree_from_device(
-        &d_dft, height, n_cols, n_cols,
-    );
+    let (root, layers) = gpu
+        .merkle
+        .build_tree_from_device(&d_dft, height, n_cols, n_cols);
     let dft_flat = gpu.stream.memcpy_dtov(&d_dft).unwrap();
     (root, dft_flat, layers)
 }
@@ -110,9 +108,11 @@ pub fn gpu_product_sumcheck_rounds(
     for _round in 0..n_rounds {
         let half = (n_evals / 2) as u32;
         let (c0, c2) = if evals_is_base {
-            gpu.sumcheck.product_sumcheck_base_ext_device(&d_evals, &d_weights, half)
+            gpu.sumcheck
+                .product_sumcheck_base_ext_device(&d_evals, &d_weights, half)
         } else {
-            gpu.sumcheck.product_sumcheck_ext_ext_device(&d_evals, &d_weights, half)
+            gpu.sumcheck
+                .product_sumcheck_ext_ext_device(&d_evals, &d_weights, half)
         };
         let r = on_round(c0, c2);
         if evals_is_base {
@@ -129,10 +129,7 @@ pub fn gpu_product_sumcheck_rounds(
 }
 
 /// GPU eq polynomial generation on device.
-pub fn gpu_eq_polynomial(
-    gpu: &GpuProverContext,
-    point: &[[u32; 5]],
-) -> CudaSlice<u32> {
+pub fn gpu_eq_polynomial(gpu: &GpuProverContext, point: &[[u32; 5]]) -> CudaSlice<u32> {
     gpu.sumcheck.eq_polynomial_device(point)
 }
 
@@ -145,5 +142,6 @@ pub fn gpu_eq_accumulate(
     offset: u32,
     n: u32,
 ) {
-    gpu.sumcheck.eq_accumulate_offset_device(d_weights, d_eq, scalar, offset, n);
+    gpu.sumcheck
+        .eq_accumulate_offset_device(d_weights, d_eq, scalar, offset, n);
 }

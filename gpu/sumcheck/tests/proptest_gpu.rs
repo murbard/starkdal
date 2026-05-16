@@ -13,11 +13,15 @@ fn gpu() -> GpuSumcheck {
 }
 
 fn random_base(n: usize, seed: u64) -> Vec<u32> {
-    (0..n).map(|i| (((i as u64 + seed) * 997 + 7) % P as u64) as u32).collect()
+    (0..n)
+        .map(|i| (((i as u64 + seed) * 997 + 7) % P as u64) as u32)
+        .collect()
 }
 
 fn random_ext(n: usize, seed: u64) -> Vec<u32> {
-    (0..n * 5).map(|i| (((i as u64 + seed) * 1337 + 13) % P as u64) as u32).collect()
+    (0..n * 5)
+        .map(|i| (((i as u64 + seed) * 1337 + 13) % P as u64) as u32)
+        .collect()
 }
 
 // ── Product sumcheck: base × ext ─────────────────────────────────────────
@@ -130,7 +134,9 @@ fn test_product_base_ext_identity() {
     let monty_one = 0x01FFFFFEu32;
     let pol_a = vec![monty_one; n];
     let mut pol_b = vec![0u32; n * 5];
-    for i in 0..n { pol_b[i * 5] = monty_one; }
+    for i in 0..n {
+        pol_b[i * 5] = monty_one;
+    }
 
     let (gpu_c0, gpu_c2) = g.product_sumcheck_base_ext(&pol_a, &pol_b);
     let (cpu_c0, cpu_c2) = cpu_product_sumcheck_base_ext(&pol_a, &pol_b);

@@ -5,7 +5,7 @@ use std::process::Command;
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernel_src = "kernel/poseidon16.cu";
-    let ptx_path = out_dir.join("poseidon16.ptx");
+    let cubin_path = out_dir.join("poseidon16.cubin");
 
     // Find nvcc: prefer CUDA_HOME, then PATH.
     let nvcc = env::var("CUDA_HOME")
@@ -14,9 +14,9 @@ fn main() {
 
     let status = Command::new(&nvcc)
         .args([
-            "--ptx",
+            "--cubin",
             "-o",
-            ptx_path.to_str().unwrap(),
+            cubin_path.to_str().unwrap(),
             kernel_src,
             // Target compute capability 8.6 (Ampere — RTX 3060).
             // Override with CUDA_ARCH env var for other GPUs.

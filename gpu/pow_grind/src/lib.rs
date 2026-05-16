@@ -7,16 +7,19 @@
 use std::ffi::CString;
 use std::sync::Arc;
 
-use koala_bear::{
-    KoalaBear, default_koalabear_poseidon1_16,
-    poseidon1_round_constants,
-    poseidon1_sparse_first_round_constants, poseidon1_sparse_first_row, poseidon1_sparse_m_i,
-    poseidon1_sparse_scalar_round_constants, poseidon1_sparse_v,
-    POSEIDON1_WIDTH,
-};
-use cudarc::driver::safe::{CudaStream, DevicePtr, DevicePtrMut};
+use cudarc::driver::safe::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
+
+const KB_P: u64 = 0x7F000001;
+fn kb_to_monty(v: u32) -> u32 {
+    (((v as u64) << 32) % KB_P) as u32
+}
 use cudarc::driver::{result as cuda_result, sys as cuda_sys};
 use field::PrimeField32;
+use koala_bear::{
+    KoalaBear, POSEIDON1_WIDTH, default_koalabear_poseidon1_16, poseidon1_round_constants,
+    poseidon1_sparse_first_round_constants, poseidon1_sparse_first_row, poseidon1_sparse_m_i,
+    poseidon1_sparse_scalar_round_constants, poseidon1_sparse_v,
+};
 
 const WIDTH: usize = POSEIDON1_WIDTH;
 
@@ -38,16 +41,17 @@ unsafe impl Sync for GpuPowGrinder {}
 
 impl Drop for GpuPowGrinder {
     fn drop(&mut self) {
-        unsafe { let _ = cuda_result::module::unload(self.cu_module); }
+        unsafe {
+            let _ = cuda_result::module::unload(self.cu_module);
+        }
     }
 }
 
 impl GpuPowGrinder {
     pub fn new(stream: Arc<CudaStream>) -> Self {
-        let ptx_src = include_str!(concat!(env!("OUT_DIR"), "/pow_grind.ptx"));
-        let c_src = CString::new(ptx_src).unwrap();
-        let cu_module = unsafe { cuda_result::module::load_data(c_src.as_ptr().cast()) }
-            .expect("failed to load PTX module");
+        let cubin = include_bytes!(concat!(env!("OUT_DIR"), "/pow_grind.cubin"));
+        let cu_module = unsafe { cuda_result::module::load_data(cubin.as_ptr().cast()) }
+            .expect("failed to load pow_grind cubin");
 
         let load_fn = |name: &str| {
             let c = CString::new(name).unwrap();
@@ -59,38 +63,68 @@ impl GpuPowGrinder {
         let field_test_fn = load_fn("field_test_kernel");
         let qe_test_fn = load_fn("qe_test_kernel");
 
-        let mut this = Self { stream, cu_module, pow_fn, field_test_fn, qe_test_fn };
+        let mut this = Self {
+            stream,
+            cu_module,
+            pow_fn,
+            field_test_fn,
+            qe_test_fn,
+        };
         this.upload_poseidon_constants();
         this
     }
 
     fn upload_poseidon_constants(&mut self) {
         let rc = poseidon1_round_constants();
-        let rc_flat: Vec<u32> = rc.iter().flat_map(|r| kb_slice_as_u32(r)).copied().collect();
+        let rc_flat: Vec<u32> = rc
+            .iter()
+            .flat_map(|r| kb_slice_as_u32(r))
+            .copied()
+            .collect();
         self.copy_to_symbol("d_rc", &rc_flat);
 
-        let mds_col_kb = KoalaBear::new_array([1,3,13,22,67,2,15,63,101,1,2,17,11,1,51,1]);
+        let mds_col_kb =
+            KoalaBear::new_array([1, 3, 13, 22, 67, 2, 15, 63, 101, 1, 2, 17, 11, 1, 51, 1]);
         let mds_col = kb_slice_as_u32(&mds_col_kb);
         let mut mds_flat = vec![0u32; WIDTH * WIDTH];
         for i in 0..WIDTH {
-            for j in 0..WIDTH { mds_flat[i * WIDTH + j] = mds_col[(WIDTH + i - j) % WIDTH]; }
+            for j in 0..WIDTH {
+                mds_flat[i * WIDTH + j] = mds_col[(WIDTH + i - j) % WIDTH];
+            }
         }
         self.copy_to_symbol("d_mds", &mds_flat);
 
-        self.copy_to_symbol("d_sparse_first_rc", kb_slice_as_u32(poseidon1_sparse_first_round_constants()));
+        self.copy_to_symbol(
+            "d_sparse_first_rc",
+            kb_slice_as_u32(poseidon1_sparse_first_round_constants()),
+        );
 
         let m_i = poseidon1_sparse_m_i();
-        let m_i_flat: Vec<u32> = m_i.iter().flat_map(|r| kb_slice_as_u32(r)).copied().collect();
+        let m_i_flat: Vec<u32> = m_i
+            .iter()
+            .flat_map(|r| kb_slice_as_u32(r))
+            .copied()
+            .collect();
         self.copy_to_symbol("d_sparse_m_i", &m_i_flat);
 
-        let fr: Vec<u32> = poseidon1_sparse_first_row().iter().flat_map(|r| kb_slice_as_u32(r)).copied().collect();
+        let fr: Vec<u32> = poseidon1_sparse_first_row()
+            .iter()
+            .flat_map(|r| kb_slice_as_u32(r))
+            .copied()
+            .collect();
         self.copy_to_symbol("d_sparse_first_row", &fr);
 
-        let v: Vec<u32> = poseidon1_sparse_v().iter().flat_map(|r| kb_slice_as_u32(r)).copied().collect();
+        let v: Vec<u32> = poseidon1_sparse_v()
+            .iter()
+            .flat_map(|r| kb_slice_as_u32(r))
+            .copied()
+            .collect();
         self.copy_to_symbol("d_sparse_v", &v);
 
-        let src: Vec<u32> = poseidon1_sparse_scalar_round_constants().iter()
-            .map(|c| kb_slice_as_u32(std::slice::from_ref(c))[0]).collect();
+        let src: Vec<u32> = poseidon1_sparse_scalar_round_constants()
+            .iter()
+            .map(|c| kb_slice_as_u32(std::slice::from_ref(c))[0])
+            .collect();
         self.copy_to_symbol("d_sparse_scalar_rc", &src);
     }
 
@@ -124,55 +158,119 @@ impl GpuPowGrinder {
         target_bits: u32,
         max_nonces: u64,
     ) -> Option<u32> {
-        let d_state = self.stream.memcpy_stod(challenger_state.as_slice()).unwrap();
+        let d_state = self
+            .stream
+            .memcpy_stod(challenger_state.as_slice())
+            .unwrap();
+        self.grind_from_device_state(&d_state, 16, nonce_slot, target_bits, max_nonces)
+    }
+
+    /// Find a nonce using a challenger state that is already resident on this
+    /// GPU context. Entries past `state_len` are treated as zero.
+    pub fn grind_from_device_state(
+        &self,
+        d_challenger_state: &CudaSlice<u32>,
+        state_len: u32,
+        nonce_slot: u32,
+        target_bits: u32,
+        max_nonces: u64,
+    ) -> Option<u32> {
+        let d_nonce = self.grind_from_device_state_device(
+            d_challenger_state,
+            state_len,
+            nonce_slot,
+            target_bits,
+            max_nonces,
+        )?;
+        let nonce_host = self.stream.memcpy_dtov(&d_nonce).unwrap();
+        Some(nonce_host[0])
+    }
+
+    /// Find a nonce using a challenger state already resident on this GPU
+    /// context and return the winning nonce as a device buffer.
+    pub fn grind_from_device_state_device(
+        &self,
+        d_challenger_state: &CudaSlice<u32>,
+        state_len: u32,
+        nonce_slot: u32,
+        target_bits: u32,
+        max_nonces: u64,
+    ) -> Option<CudaSlice<u32>> {
+        assert!(state_len <= WIDTH as u32);
+        if max_nonces == 0 {
+            return None;
+        }
         let mut d_nonce = self.stream.alloc_zeros::<u32>(1).unwrap();
         let mut d_flag = self.stream.alloc_zeros::<u32>(1).unwrap();
+        self.grind_from_device_state_device_async(
+            d_challenger_state,
+            state_len,
+            nonce_slot,
+            target_bits,
+            max_nonces,
+            &mut d_nonce,
+            &mut d_flag,
+        );
+        self.stream.synchronize().unwrap();
 
-        let threads: u32 = 256;
-        let batch_size: u64 = 1 << 20; // 1M nonces per launch
-
-        let mut offset: u64 = 0;
-        while offset < max_nonces {
-            let this_batch = batch_size.min(max_nonces - offset) as u32;
-            let blocks = (this_batch + threads - 1) / threads;
-
-            // Scope device pointer borrows so guards drop before memcpy_dtov.
-            {
-                let (state_ptr, _g1) = d_state.device_ptr(&self.stream);
-                let (nonce_ptr, _g2) = d_nonce.device_ptr_mut(&self.stream);
-                let (flag_ptr, _g3) = d_flag.device_ptr_mut(&self.stream);
-
-                let mut args: Vec<*mut std::ffi::c_void> = vec![
-                    &state_ptr as *const _ as *mut _,
-                    &nonce_ptr as *const _ as *mut _,
-                    &flag_ptr as *const _ as *mut _,
-                    &target_bits as *const _ as *mut _,
-                    &nonce_slot as *const _ as *mut _,
-                    &offset as *const _ as *mut _,
-                ];
-
-                unsafe {
-                    cuda_result::launch_kernel(
-                        self.pow_fn,
-                        (blocks, 1, 1),
-                        (threads, 1, 1),
-                        0,
-                        self.stream.cu_stream(),
-                        &mut args,
-                    ).expect("pow_grind kernel launch failed");
-                }
-            }
-            self.stream.synchronize().unwrap();
-
-            let flag_host = self.stream.memcpy_dtov(&d_flag).unwrap();
-            if flag_host[0] != 0 {
-                let nonce_host = self.stream.memcpy_dtov(&d_nonce).unwrap();
-                return Some(nonce_host[0]);
-            }
-
-            offset += batch_size;
+        let flag_host = self.stream.memcpy_dtov(&d_flag).unwrap();
+        if flag_host[0] != 0 {
+            Some(d_nonce)
+        } else {
+            None
         }
-        None
+    }
+
+    /// Launch a single device-side PoW search into preallocated output buffers.
+    ///
+    /// The caller is responsible for synchronizing the stream and checking `d_flag`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn grind_from_device_state_device_async(
+        &self,
+        d_challenger_state: &CudaSlice<u32>,
+        state_len: u32,
+        nonce_slot: u32,
+        target_bits: u32,
+        max_nonces: u64,
+        d_nonce: &mut CudaSlice<u32>,
+        d_flag: &mut CudaSlice<u32>,
+    ) {
+        assert!(state_len <= WIDTH as u32);
+        if max_nonces == 0 {
+            return;
+        }
+
+        let threads = 256u32;
+        let max_blocks = 65_535u32;
+        let blocks = ((max_nonces + threads as u64 - 1) / threads as u64)
+            .min(max_blocks as u64)
+            .max(1) as u32;
+
+        let (state_ptr, _g1) = d_challenger_state.device_ptr(&self.stream);
+        let (nonce_ptr, _g2) = d_nonce.device_ptr_mut(&self.stream);
+        let (flag_ptr, _g3) = d_flag.device_ptr_mut(&self.stream);
+
+        let mut args: Vec<*mut std::ffi::c_void> = vec![
+            &state_ptr as *const _ as *mut _,
+            &nonce_ptr as *const _ as *mut _,
+            &flag_ptr as *const _ as *mut _,
+            &state_len as *const _ as *mut _,
+            &target_bits as *const _ as *mut _,
+            &nonce_slot as *const _ as *mut _,
+            &max_nonces as *const _ as *mut _,
+        ];
+
+        unsafe {
+            cuda_result::launch_kernel(
+                self.pow_fn,
+                (blocks, 1, 1),
+                (threads, 1, 1),
+                0,
+                self.stream.cu_stream(),
+                &mut args,
+            )
+            .expect("pow_grind kernel launch failed");
+        }
     }
 
     // ── Field testing ────────────────────────────────────────────────────
@@ -203,9 +301,14 @@ impl GpuPowGrinder {
 
             unsafe {
                 cuda_result::launch_kernel(
-                    self.field_test_fn, (blocks, 1, 1), (threads, 1, 1),
-                    0, self.stream.cu_stream(), &mut args,
-                ).expect("field_test kernel launch failed");
+                    self.field_test_fn,
+                    (blocks, 1, 1),
+                    (threads, 1, 1),
+                    0,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("field_test kernel launch failed");
             }
         }
         self.stream.synchronize().unwrap();
@@ -239,16 +342,23 @@ impl GpuPowGrinder {
 
             unsafe {
                 cuda_result::launch_kernel(
-                    self.qe_test_fn, (blocks, 1, 1), (threads, 1, 1),
-                    0, self.stream.cu_stream(), &mut args,
-                ).expect("qe_test kernel launch failed");
+                    self.qe_test_fn,
+                    (blocks, 1, 1),
+                    (threads, 1, 1),
+                    0,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("qe_test kernel launch failed");
             }
         }
         self.stream.synchronize().unwrap();
         self.stream.memcpy_dtov(&d_out).unwrap()
     }
 
-    pub fn stream(&self) -> &Arc<CudaStream> { &self.stream }
+    pub fn stream(&self) -> &Arc<CudaStream> {
+        &self.stream
+    }
 
     /// Static convenience: create a temporary GPU context, grind, return nonce.
     /// Returns None if GPU not available.
@@ -265,18 +375,15 @@ impl GpuPowGrinder {
             let stream = ctx.default_stream();
             Some(GpuPowGrinder::new(stream))
         });
-        inst.as_ref()?.grind(challenger_state, nonce_slot, target_bits, max_nonces)
+        inst.as_ref()?
+            .grind(challenger_state, nonce_slot, target_bits, max_nonces)
     }
 }
 
 // ── CPU reference for PoW ────────────────────────────────────────────────
 
 /// CPU PoW grind: brute-force search for a nonce.
-pub fn cpu_pow_grind(
-    challenger_state: &[u32; 16],
-    nonce_slot: usize,
-    target_bits: u32,
-) -> u32 {
+pub fn cpu_pow_grind(challenger_state: &[u32; 16], nonce_slot: usize, target_bits: u32) -> u32 {
     let p = default_koalabear_poseidon1_16();
     let mask = (1u32 << target_bits) - 1;
 
@@ -331,7 +438,8 @@ mod tests {
         let [add, sub, mul, cube] = cpu_field_ops(one, two);
         let three = unsafe { std::mem::transmute::<KoalaBear, u32>(KoalaBear::new(3)) };
         assert_eq!(add, three); // 1 + 2 = 3
-        let neg_one = unsafe { std::mem::transmute::<KoalaBear, u32>(KoalaBear::new(0x7F000001 - 1)) };
+        let neg_one =
+            unsafe { std::mem::transmute::<KoalaBear, u32>(KoalaBear::new(0x7F000001 - 1)) };
         assert_eq!(sub, neg_one); // 1 - 2 = -1
         assert_eq!(mul, two); // 1 * 2 = 2
         assert_eq!(cube, one); // 1^3 = 1

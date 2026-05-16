@@ -21,7 +21,8 @@
 __device__ void eval_execution_air(
     const uint32_t up[20],
     const uint32_t down[2],
-    uint32_t constraints[13]  // output: each constraint expression (base field)
+    uint32_t constraints[13],  // output: 12 constraint expressions (base field) + slot 12 unused
+    uint32_t* bus_data = nullptr  // optional output: 5 values for bus constraint
 ) {
     // Column aliases.
     uint32_t pc = up[0], fp = up[1];
@@ -82,8 +83,20 @@ __device__ void eval_execution_air(
     constraints[10] = kb_mul(not_jump_cond, kb_sub(next_pc, pc_plus_one));
     constraints[11] = kb_mul(not_jump_cond, kb_sub(next_fp, fp));
 
-    // Constraint 12: bus column evaluation (simplified — full version needs
-    // extension field alphas which are handled at the kernel level).
-    // For now, set to zero (bus constraint handled separately).
+    // Constraint 12 slot: NOT USED — the bus constraint is at index 0 in the
+    // CPU (before the 12 assert_zero constraints). It's ext-field valued and
+    // computed separately in the kernel using bus_data_out below.
     constraints[12] = 0;
+
+    // Output bus data for the bus constraint computation.
+    // bus_data[0] = is_precompile (flag)
+    // bus_data[1] = precompile_data = up[19]
+    // bus_data[2] = nu_a, bus_data[3] = nu_b, bus_data[4] = nu_c
+    if (bus_data) {
+        bus_data[0] = kb_neg(kb_sub(kb_add(kb_add(add_flag, mul_flag), kb_add(deref, jump)), ONE));
+        bus_data[1] = up[19]; // precompile_data
+        bus_data[2] = nu_a;
+        bus_data[3] = nu_b;
+        bus_data[4] = nu_c;
+    }
 }

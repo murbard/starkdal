@@ -79,10 +79,7 @@ fn generate_program(n_eval: usize, m: usize) -> String {
             i * DIGEST_LEN
         ));
         for k in 0..DIM {
-            p.push_str(&format!(
-                "    challenges[{}] = ch_{i}[{k}]\n",
-                i * DIM + k
-            ));
+            p.push_str(&format!("    challenges[{}] = ch_{i}[{k}]\n", i * DIM + k));
         }
     }
     p.push_str("\n");
@@ -232,9 +229,7 @@ fn compute_batch_ref(
     let mut current = c_star;
     for beta in &fold_betas {
         let half = current.len() / 2;
-        current = (0..half)
-            .map(|j| current[2 * j] + *beta * current[2 * j + 1])
-            .collect();
+        current = (0..half).map(|j| current[2 * j] + *beta * current[2 * j + 1]).collect();
     }
     let fold_result = current[0];
 
@@ -265,14 +260,26 @@ fn compute_batch_ref(
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let log_poly: usize = args.iter().position(|a| a == "--log-poly")
-        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(3);
-    let m: usize = args.iter().position(|a| a == "--m")
-        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(3);
-    let batches: usize = args.iter().position(|a| a == "--batches")
-        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(1);
-    let concurrency: usize = args.iter().position(|a| a == "--concurrency")
-        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(1);
+    let log_poly: usize = args
+        .iter()
+        .position(|a| a == "--log-poly")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(3);
+    let m: usize = args
+        .iter()
+        .position(|a| a == "--m")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(3);
+    let batches: usize = args
+        .iter()
+        .position(|a| a == "--batches")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(1);
+    let concurrency: usize = args
+        .iter()
+        .position(|a| a == "--concurrency")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(1);
 
     assert!(m >= 1, "m must be at least 1");
     assert!(batches >= 1, "batches must be at least 1");
@@ -286,13 +293,19 @@ fn main() {
     eprintln!("RLC + Fold benchmark");
     eprintln!("============================================================");
     eprintln!("  n_eval={n_eval}  d={d}  m={m}  batches={batches}  concurrency={concurrency}");
-    eprintln!("  cores={n_cores}  total_codewords={}  data={:.1} MB",
-        batches * m, (batches * m * d * 4) as f64 / (1024.0 * 1024.0));
+    eprintln!(
+        "  cores={n_cores}  total_codewords={}  data={:.1} MB",
+        batches * m,
+        (batches * m * d * 4) as f64 / (1024.0 * 1024.0)
+    );
 
     // ── compile shared bytecode ──
     let program = generate_program(n_eval, m);
-    eprintln!("  program: {} lines, {:.1} KB",
-        program.lines().count(), program.len() as f64 / 1024.0);
+    eprintln!(
+        "  program: {} lines, {:.1} KB",
+        program.lines().count(),
+        program.len() as f64 / 1024.0
+    );
     let t0 = Instant::now();
     let bytecode = compile_program(&ProgramSource::Raw(program));
     eprintln!("  compiled in {:.3}s", t0.elapsed().as_secs_f64());
@@ -320,10 +333,16 @@ fn main() {
                 hints.insert("codewords_col".to_string(), vec![br.cw_col.clone()]);
                 hints.insert("roots".to_string(), vec![br.roots_flat.clone()]);
                 prove_execution(
-                    &bytecode, &br.pi,
-                    &ExecutionWitness { preamble_memory_len: 0, hints },
-                    &default_whir_config(1), false,
-                ).unwrap_or_else(|e| panic!("batch {bi} failed: {e}"))
+                    &bytecode,
+                    &br.pi,
+                    &ExecutionWitness {
+                        preamble_memory_len: 0,
+                        hints,
+                    },
+                    &default_whir_config(1),
+                    false,
+                )
+                .unwrap_or_else(|e| panic!("batch {bi} failed: {e}"))
             })
             .collect();
         all_proofs.extend(round);
@@ -346,15 +365,22 @@ fn main() {
 
     eprintln!();
     eprintln!("------------------------------------------------------------");
-    eprintln!("  Prove wall   : {:.3}s ({} batches × {concurrency} parallel)",
-        prove_time.as_secs_f64(), batches);
+    eprintln!(
+        "  Prove wall   : {:.3}s ({} batches × {concurrency} parallel)",
+        prove_time.as_secs_f64(),
+        batches
+    );
     eprintln!("  Verify wall  : {:.3}s", verify_time.as_secs_f64());
     eprintln!("  Total cycles : {total_cycles}  poseidons: {total_poseidons}");
     eprintln!("  Data         : {:.2} MB", total_data as f64 / (1024.0 * 1024.0));
-    eprintln!("  Throughput   : {:.1} KB/s (prove only)",
-        total_data as f64 / 1024.0 / prove_time.as_secs_f64());
-    eprintln!("  Throughput   : {:.1} KB/s (prove + verify)",
-        total_data as f64 / 1024.0 / (prove_time.as_secs_f64() + verify_time.as_secs_f64()));
+    eprintln!(
+        "  Throughput   : {:.1} KB/s (prove only)",
+        total_data as f64 / 1024.0 / prove_time.as_secs_f64()
+    );
+    eprintln!(
+        "  Throughput   : {:.1} KB/s (prove + verify)",
+        total_data as f64 / 1024.0 / (prove_time.as_secs_f64() + verify_time.as_secs_f64())
+    );
     eprintln!("  Peak RSS     : {:.2} GB", peak_rss as f64 / (1u64 << 30) as f64);
     eprintln!("------------------------------------------------------------");
 

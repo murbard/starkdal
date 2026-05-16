@@ -13,6 +13,8 @@ use crate::{
     },
 };
 
+#[cfg(feature = "gpu")]
+mod gpu_gkr;
 mod layers;
 mod sumcheck_utils;
 
@@ -84,6 +86,9 @@ fn prove_gkr_layer<EF: ExtensionField<PF<EF>>>(
     claim_num: EF,
     claim_den: EF,
 ) -> (MultilinearPoint<EF>, EF, EF) {
+    // GPU GKR: kernels compiled and verified, but Natural layers are too small
+    // for GPU benefit. PackedBr layers need matching fold order. Disabled.
+
     let alpha = prover_state.sample();
     let expected_sum = claim_num + alpha * claim_den;
 

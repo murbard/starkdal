@@ -205,6 +205,19 @@ __device__ __forceinline__ void qe_square(const uint32_t a[5], uint32_t out[5]) 
              kb_mul(two_a1, a[3])), two_a3_a4);
 }
 
+// Quintic extension halving: out = a / 2 (component-wise).
+__device__ __forceinline__ void qe_halve(const uint32_t a[5], uint32_t out[5]) {
+    #pragma unroll
+    for (int i = 0; i < 5; i++) out[i] = kb_halve(a[i]);
+}
+
+// Quintic extension cube: out = a^3.
+__device__ __forceinline__ void qe_cube(const uint32_t a[5], uint32_t out[5]) {
+    uint32_t sq[5];
+    qe_square(a, sq);
+    qe_mul(sq, a, out);
+}
+
 // Quintic extension: set to zero.
 __device__ __forceinline__ void qe_zero(uint32_t out[5]) {
     #pragma unroll
@@ -221,4 +234,88 @@ __device__ __forceinline__ void qe_one(uint32_t out[5]) {
 __device__ __forceinline__ void qe_from_base(uint32_t scalar, uint32_t out[5]) {
     out[0] = scalar;
     out[1] = 0; out[2] = 0; out[3] = 0; out[4] = 0;
+}
+
+// Quintic extension Frobenius matrix, matching
+// lean-da/crates/backend/koala-bear/src/quintic_extension/mod.rs.
+// Constants are stored in Montgomery form.
+__device__ __constant__ uint32_t KB_QE_FROBENIUS[4][5] = {
+    {765015189u, 235704805u, 564529442u, 1275025315u, 1102401726u},
+    {169616684u, 1188396601u, 806656646u, 992929951u, 830547243u},
+    {905752085u, 405622337u, 1280056543u, 122670283u, 1249984505u},
+    {688953779u, 980828988u, 565273709u, 1858491776u, 932120269u},
+};
+
+// Frobenius endomorphism over F[X] / (X^5 + X^2 - 1), matching the CPU
+// implementation in quintic_extension/extension.rs exactly.
+__device__ __forceinline__ void qe_frobenius(const uint32_t a[5], uint32_t out[5]) {
+    out[0] = a[0];
+    out[1] = 0;
+    out[2] = 0;
+    out[3] = 0;
+    out[4] = 0;
+
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+        uint32_t ai = a[i + 1];
+        out[0] = kb_add(out[0], kb_mul(ai, KB_QE_FROBENIUS[i][0]));
+        out[1] = kb_add(out[1], kb_mul(ai, KB_QE_FROBENIUS[i][1]));
+        out[2] = kb_add(out[2], kb_mul(ai, KB_QE_FROBENIUS[i][2]));
+        out[3] = kb_add(out[3], kb_mul(ai, KB_QE_FROBENIUS[i][3]));
+        out[4] = kb_add(out[4], kb_mul(ai, KB_QE_FROBENIUS[i][4]));
+    }
+}
+
+__device__ __forceinline__ void qe_repeated_frobenius(
+    const uint32_t a[5], int count, uint32_t out[5]
+) {
+    if (count <= 0) {
+        #pragma unroll
+        for (int i = 0; i < 5; i++) out[i] = a[i];
+        return;
+    }
+
+    count %= 5;
+    if (count == 0) {
+        #pragma unroll
+        for (int i = 0; i < 5; i++) out[i] = a[i];
+        return;
+    }
+
+    qe_frobenius(a, out);
+    for (int i = 1; i < count; i++) {
+        uint32_t next[5];
+        qe_frobenius(out, next);
+        #pragma unroll
+        for (int k = 0; k < 5; k++) out[k] = next[k];
+    }
+}
+
+// Exact quintic inverse formula from the CPU prover.
+__device__ __forceinline__ void qe_inv(const uint32_t a[5], uint32_t out[5]) {
+    uint32_t a_exp_q[5];
+    qe_frobenius(a, a_exp_q);
+
+    uint32_t a_mul_aq[5];
+    qe_mul(a, a_exp_q, a_mul_aq);
+
+    uint32_t a_exp_q_plus_q_sq[5];
+    qe_frobenius(a_mul_aq, a_exp_q_plus_q_sq);
+
+    uint32_t a_exp_q3_plus_q4[5];
+    qe_repeated_frobenius(a_exp_q_plus_q_sq, 2, a_exp_q3_plus_q4);
+
+    uint32_t prod_conj[5];
+    qe_mul(a_exp_q_plus_q_sq, a_exp_q3_plus_q4, prod_conj);
+
+    uint32_t norm_weights[5] = {
+        prod_conj[0],
+        prod_conj[4],
+        prod_conj[3],
+        prod_conj[2],
+        kb_sub(prod_conj[1], prod_conj[4]),
+    };
+    uint32_t norm = kb_dot5(a, norm_weights);
+    uint32_t norm_inv = kb_inv(norm);
+    qe_base_mul(prod_conj, norm_inv, out);
 }

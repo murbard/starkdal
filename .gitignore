@@ -2,6 +2,7 @@
 target/
 
 # Credentials
+.env
 .aws
 *.pem
 *.key

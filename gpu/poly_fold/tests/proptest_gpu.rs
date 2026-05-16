@@ -174,7 +174,9 @@ fn test_fold_base_r_one() {
 fn test_fold_large_base_lsb() {
     let g = gpu();
     let n = 1 << 16; // 64K elements
-    let data: Vec<u32> = (0..n).map(|i| ((i as u64 * 1337 + 42) % P as u64) as u32).collect();
+    let data: Vec<u32> = (0..n)
+        .map(|i| ((i as u64 * 1337 + 42) % P as u64) as u32)
+        .collect();
     let r = 12345u32 % P;
     let gpu_out = g.fold_base(&data, r, FoldMode::Lsb);
     let cpu_out = cpu_fold_base_lsb(&data, r);
@@ -185,7 +187,9 @@ fn test_fold_large_base_lsb() {
 fn test_fold_large_ext_half() {
     let g = gpu();
     let n = 1 << 12; // 4K ext elements = 20K u32s per half
-    let data: Vec<u32> = (0..(n * 2 * 5)).map(|i| ((i as u64 * 997 + 7) % P as u64) as u32).collect();
+    let data: Vec<u32> = (0..(n * 2 * 5))
+        .map(|i| ((i as u64 * 997 + 7) % P as u64) as u32)
+        .collect();
     let r: [u32; 5] = [100, 200, 300, 400, 500].map(|v| v % P);
     let gpu_out = g.fold_ext(&data, &r, FoldMode::Half);
     let cpu_out = cpu_fold_ext_half(&data, &r);
@@ -196,7 +200,9 @@ fn test_fold_large_ext_half() {
 fn test_fold_chained() {
     // Simulate a sumcheck: fold base→ext, then ext→ext, then ext→ext.
     let g = gpu();
-    let data: Vec<u32> = (0..256).map(|i| ((i as u64 * 7919 + 13) % P as u64) as u32).collect();
+    let data: Vec<u32> = (0..256)
+        .map(|i| ((i as u64 * 7919 + 13) % P as u64) as u32)
+        .collect();
     let r0: [u32; 5] = [111, 222, 333, 444, 555].map(|v| v % P);
     let r1: [u32; 5] = [666, 777, 888, 999, 1010].map(|v| v % P);
     let r2: [u32; 5] = [1111, 2222, 3333, 4444, 5555].map(|v| v % P);

@@ -67,22 +67,39 @@ impl GpuProverState {
         let stream = &gpu.stream;
 
         let upload_cols = |cols: &[Vec<u32>]| -> Vec<CudaSlice<u32>> {
-            cols.iter().map(|c| stream.memcpy_stod(c).unwrap()).collect()
+            cols.iter()
+                .map(|c| stream.memcpy_stod(c).unwrap())
+                .collect()
         };
 
         let upload_down = |cols: &[Vec<u32>], indices: &[usize]| -> Vec<CudaSlice<u32>> {
-            indices.iter().map(|&i| {
-                let col = &cols[i];
-                let n = col.len();
-                let mut shifted = col[1..].to_vec();
-                shifted.push(col[n - 1]);
-                stream.memcpy_stod(&shifted).unwrap()
-            }).collect()
+            indices
+                .iter()
+                .map(|&i| {
+                    let col = &cols[i];
+                    let n = col.len();
+                    let mut shifted = col[1..].to_vec();
+                    shifted.push(col[n - 1]);
+                    stream.memcpy_stod(&shifted).unwrap()
+                })
+                .collect()
         };
 
-        let exec_n_rows = if exec_cols.is_empty() { 0 } else { exec_cols[0].len() };
-        let extop_n_rows = if extop_cols.is_empty() { 0 } else { extop_cols[0].len() };
-        let pos_n_rows = if pos_cols.is_empty() { 0 } else { pos_cols[0].len() };
+        let exec_n_rows = if exec_cols.is_empty() {
+            0
+        } else {
+            exec_cols[0].len()
+        };
+        let extop_n_rows = if extop_cols.is_empty() {
+            0
+        } else {
+            extop_cols[0].len()
+        };
+        let pos_n_rows = if pos_cols.is_empty() {
+            0
+        } else {
+            pos_cols[0].len()
+        };
 
         Self {
             d_exec_cols: upload_cols(exec_cols),
@@ -145,12 +162,14 @@ impl GpuProverState {
         offset += self.exec_n_rows.max(1 << bytecode_log_size);
 
         // Stack table columns in height-sorted order (exec first as largest).
-        for ci in 0..exec_n_cols.min(20) { // execution has 20 committed cols
+        for ci in 0..exec_n_cols.min(20) {
+            // execution has 20 committed cols
             let col = self.gpu.stream.memcpy_dtov(&self.d_exec_cols[ci]).unwrap();
             stacked[offset..offset + self.exec_n_rows].copy_from_slice(&col[..self.exec_n_rows]);
             offset += self.exec_n_rows;
         }
-        for ci in 0..extop_n_cols.min(29) { // extension_op has 29 cols
+        for ci in 0..extop_n_cols.min(29) {
+            // extension_op has 29 cols
             let col = self.gpu.stream.memcpy_dtov(&self.d_extop_cols[ci]).unwrap();
             stacked[offset..offset + self.extop_n_rows].copy_from_slice(&col[..self.extop_n_rows]);
             offset += self.extop_n_rows;
@@ -175,21 +194,26 @@ impl GpuProverState {
         folding_factor: usize,
         log_inv_rate: usize,
     ) -> (Vec<u32>, CudaSlice<u32>, Vec<Vec<u32>>) {
-        let d_stacked = self.d_stacked.as_ref().expect("call stack_polynomial first");
+        let d_stacked = self
+            .d_stacked
+            .as_ref()
+            .expect("call stack_polynomial first");
         let n_evals = 1u32 << self.stacked_n_vars;
         let n_cols = 1u32 << folding_factor;
 
         // Reorder + DFT on device.
-        let d_dft = self.gpu.ntt.reorder_and_dft_device(
-            d_stacked, n_evals, folding_factor, log_inv_rate,
-        );
+        let d_dft =
+            self.gpu
+                .ntt
+                .reorder_and_dft_device(d_stacked, n_evals, folding_factor, log_inv_rate);
 
         // Merkle on DFT output (stays on device).
         let full_len = (n_evals as u64) << log_inv_rate;
         let height = (full_len / n_cols as u64) as u32;
-        let (root, layers) = self.gpu.merkle.build_tree_from_device(
-            &d_dft, height, n_cols, n_cols,
-        );
+        let (root, layers) = self
+            .gpu
+            .merkle
+            .build_tree_from_device(&d_dft, height, n_cols, n_cols);
 
         (root, d_dft, layers)
     }
@@ -217,9 +241,13 @@ impl GpuProverState {
         for _ in 0..n_rounds {
             let half = (n / 2) as u32;
             let (c0, c2) = if is_base {
-                self.gpu.sumcheck.product_sumcheck_base_ext_device(&d_e, &d_w, half)
+                self.gpu
+                    .sumcheck
+                    .product_sumcheck_base_ext_device(&d_e, &d_w, half)
             } else {
-                self.gpu.sumcheck.product_sumcheck_ext_ext_device(&d_e, &d_w, half)
+                self.gpu
+                    .sumcheck
+                    .product_sumcheck_ext_ext_device(&d_e, &d_w, half)
             };
 
             let r = on_round(c0, c2);
@@ -255,7 +283,9 @@ impl GpuProverState {
         offset: u32,
         n: u32,
     ) {
-        self.gpu.sumcheck.eq_accumulate_offset_device(d_weights, d_eq, scalar, offset, n);
+        self.gpu
+            .sumcheck
+            .eq_accumulate_offset_device(d_weights, d_eq, scalar, offset, n);
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -269,7 +299,9 @@ impl GpuProverState {
         d_dens: &CudaSlice<u32>,
         n_pairs: u32,
     ) -> (CudaSlice<u32>, CudaSlice<u32>) {
-        self.gpu.sumcheck.gkr_sum_quotients_device(d_nums, d_dens, n_pairs)
+        self.gpu
+            .sumcheck
+            .gkr_sum_quotients_device(d_nums, d_dens, n_pairs)
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -287,7 +319,12 @@ impl GpuProverState {
         n_pairs: u32,
     ) -> ([u32; 5], [u32; 5]) {
         self.gpu.sumcheck.air_sumcheck_execution_device(
-            d_columns, d_down_cols, d_eq_factor, alphas, n_rows, n_pairs,
+            d_columns,
+            d_down_cols,
+            d_eq_factor,
+            alphas,
+            n_rows,
+            n_pairs,
         )
     }
 

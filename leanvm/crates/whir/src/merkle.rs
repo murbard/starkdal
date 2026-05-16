@@ -64,11 +64,15 @@ fn build_merkle_tree_koalabear(
     // GPU fast path: leaf hashing + binary reduction on GPU.
     // GPU tree layers now include correct padding for path opening.
     #[cfg(feature = "gpu")]
-    if let Some(digest_layers) = crate::gpu_backend::gpu_build_merkle_digests(
-        &leaf.values, leaf.height(), full_base_width, leaf.width(),
-    ) {
+    if let Some(digest_layers) =
+        crate::gpu_backend::gpu_build_merkle_digests(&leaf.values, leaf.height(), full_base_width, leaf.width())
+    {
         let tree = symetric::merkle::MerkleTree { digest_layers };
-        return WhirMerkleTree { leaf, tree, full_leaf_base_width: full_base_width };
+        return WhirMerkleTree {
+            leaf,
+            tree,
+            full_leaf_base_width: full_base_width,
+        };
     }
 
     let perm = default_koalabear_poseidon1_16();

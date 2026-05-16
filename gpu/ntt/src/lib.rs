@@ -10,10 +10,10 @@
 use std::ffi::CString;
 use std::sync::Arc;
 
-use koala_bear::KoalaBear;
 use cudarc::driver::safe::{CudaSlice, CudaStream, DevicePtr, DevicePtrMut};
 use cudarc::driver::{result as cuda_result, sys as cuda_sys};
 use field::{Field, PrimeCharacteristicRing, PrimeField32, TwoAdicField};
+use koala_bear::KoalaBear;
 
 const P: u32 = 0x7F000001;
 
@@ -47,13 +47,7 @@ pub fn build_root_table(log_n: usize) -> Vec<Vec<u32>> {
 
     // Layer i: take every 2^i-th root.
     (0..log_n)
-        .map(|i| {
-            nth_roots
-                .iter()
-                .step_by(1 << i)
-                .copied()
-                .collect()
-        })
+        .map(|i| nth_roots.iter().step_by(1 << i).copied().collect())
         .collect()
 }
 
@@ -64,9 +58,7 @@ pub fn build_inv_root_table(root_table: &[Vec<u32>]) -> Vec<Vec<u32>> {
         .map(|layer| {
             layer
                 .iter()
-                .map(|&tw| {
-                    if tw == 0 { 0 } else { kb_u32(kb(tw).inverse()) }
-                })
+                .map(|&tw| if tw == 0 { 0 } else { kb_u32(kb(tw).inverse()) })
                 .collect()
         })
         .collect()
@@ -82,6 +74,91 @@ pub struct GpuNtt {
     fn_dft_fused: cuda_sys::CUfunction,
     fn_idft_fused: cuda_sys::CUfunction,
     fn_prepare_evals: cuda_sys::CUfunction,
+    fn_prepare_evals_ext: cuda_sys::CUfunction,
+}
+
+pub struct GpuNttOutput {
+    pub d_data: CudaSlice<u32>,
+    _guards: Vec<CudaSlice<u32>>,
+}
+
+impl GpuNttOutput {
+    pub fn into_parts(self) -> (CudaSlice<u32>, Vec<CudaSlice<u32>>) {
+        (self.d_data, self._guards)
+    }
+}
+
+pub struct GpuNttTwiddles {
+    log_height: usize,
+    width: usize,
+    fused: bool,
+    d_fused_twiddles: Option<CudaSlice<u32>>,
+    d_fused_offsets: Option<CudaSlice<u32>>,
+    d_layer_twiddles: Vec<CudaSlice<u32>>,
+}
+
+impl GpuNttTwiddles {
+    pub fn upload(stream: &Arc<CudaStream>, log_height: usize, width: usize) -> Self {
+        let root_table = build_root_table(log_height);
+        let fused = width == 1 && log_height >= 4;
+
+        if fused {
+            let fused_layers = GpuNtt::FUSED_LOG.min(log_height);
+            let mut all_twiddles = Vec::new();
+            let mut tw_offsets = Vec::new();
+            for k in 0..fused_layers {
+                tw_offsets.push(all_twiddles.len() as u32);
+                let layer_idx = log_height - 1 - k;
+                all_twiddles.extend_from_slice(&root_table[layer_idx]);
+            }
+            tw_offsets.push(all_twiddles.len() as u32);
+
+            let remaining_layers = log_height - fused_layers;
+            let d_layer_twiddles = (0..remaining_layers)
+                .map(|k| {
+                    let layer_idx = remaining_layers - 1 - k;
+                    stream
+                        .memcpy_stod(&root_table[layer_idx])
+                        .expect("upload NTT DFT twiddles")
+                })
+                .collect();
+
+            Self {
+                log_height,
+                width,
+                fused,
+                d_fused_twiddles: Some(
+                    stream
+                        .memcpy_stod(&all_twiddles)
+                        .expect("upload fused NTT DFT twiddles"),
+                ),
+                d_fused_offsets: Some(
+                    stream
+                        .memcpy_stod(&tw_offsets)
+                        .expect("upload fused NTT DFT offsets"),
+                ),
+                d_layer_twiddles,
+            }
+        } else {
+            let d_layer_twiddles = (0..log_height)
+                .rev()
+                .map(|layer_idx| {
+                    stream
+                        .memcpy_stod(&root_table[layer_idx])
+                        .expect("upload NTT DFT twiddles")
+                })
+                .collect();
+
+            Self {
+                log_height,
+                width,
+                fused,
+                d_fused_twiddles: None,
+                d_fused_offsets: None,
+                d_layer_twiddles,
+            }
+        }
+    }
 }
 
 unsafe impl Send for GpuNtt {}
@@ -97,10 +174,9 @@ impl Drop for GpuNtt {
 
 impl GpuNtt {
     pub fn new(stream: Arc<CudaStream>) -> Self {
-        let ptx_src = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
-        let c_src = CString::new(ptx_src).unwrap();
-        let cu_module = unsafe { cuda_result::module::load_data(c_src.as_ptr().cast()) }
-            .expect("failed to load ntt PTX");
+        let cubin = include_bytes!(concat!(env!("OUT_DIR"), "/ntt.cubin"));
+        let cu_module = unsafe { cuda_result::module::load_data(cubin.as_ptr().cast()) }
+            .expect("failed to load ntt cubin");
 
         let load = |name: &str| {
             let c = CString::new(name).unwrap();
@@ -108,14 +184,35 @@ impl GpuNtt {
                 .unwrap_or_else(|e| panic!("{name}: {e:?}"))
         };
 
+        let fn_dft_fused = load("evals_dft_fused_kernel");
+        let fn_idft_fused = load("evals_idft_fused_kernel");
+
+        // If FUSED_LOG > 13 (>32KB shared memory), request larger dynamic shared memory.
+        if Self::FUSED_LOG > 13 {
+            let max_smem = ((1u32 << Self::FUSED_LOG) * 4) as i32;
+            unsafe {
+                cuda_sys::cuFuncSetAttribute(
+                    fn_dft_fused,
+                    cuda_sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    max_smem,
+                );
+                cuda_sys::cuFuncSetAttribute(
+                    fn_idft_fused,
+                    cuda_sys::CUfunction_attribute::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    max_smem,
+                );
+            }
+        }
+
         Self {
             stream,
             cu_module,
             fn_dft_layer: load("evals_dft_layer_kernel"),
             fn_idft_layer: load("evals_idft_layer_kernel"),
-            fn_dft_fused: load("evals_dft_fused_kernel"),
-            fn_idft_fused: load("evals_idft_fused_kernel"),
+            fn_dft_fused,
+            fn_idft_fused,
             fn_prepare_evals: load("prepare_evals_for_fft_kernel"),
+            fn_prepare_evals_ext: load("prepare_evals_for_fft_ext_kernel"),
         }
     }
 
@@ -127,8 +224,22 @@ impl GpuNtt {
     /// `width`: number of columns.
     /// Maximum number of layers to fuse in shared memory.
     /// Limited by shared memory size: 2^FUSED_LOG elements × 4 bytes.
-    /// 2^13 = 8192 elements = 32 KB shared memory — fits on all modern GPUs.
-    const FUSED_LOG: usize = 13;
+    /// Default 13 (32 KB) fits all GPUs. Override with FUSED_NTT_LOG env var
+    /// for GPUs with more shared memory (e.g., 15 for A100's 164 KB).
+    const FUSED_LOG: usize = match option_env!("FUSED_NTT_LOG") {
+        Some(s) => {
+            // const parsing: only supports single/double digit
+            let bytes = s.as_bytes();
+            if bytes.len() == 2 {
+                ((bytes[0] - b'0') * 10 + (bytes[1] - b'0')) as usize
+            } else if bytes.len() == 1 {
+                (bytes[0] - b'0') as usize
+            } else {
+                13
+            }
+        }
+        None => 13,
+    };
 
     pub fn dft_in_place(
         &self,
@@ -142,6 +253,41 @@ impl GpuNtt {
         } else {
             self.dft_in_place_per_layer(d_data, root_table, log_height, width);
         }
+    }
+
+    pub fn dft_in_place_guarded(
+        &self,
+        d_data: &mut CudaSlice<u32>,
+        root_table: &[Vec<u32>],
+        log_height: usize,
+        width: usize,
+    ) -> Vec<CudaSlice<u32>> {
+        if width == 1 && log_height >= 4 {
+            self.dft_in_place_fused_guarded(d_data, root_table, log_height)
+        } else {
+            self.dft_in_place_per_layer_guarded(d_data, root_table, log_height, width)
+        }
+    }
+
+    pub fn dft_in_place_guarded_with_twiddles(
+        &self,
+        d_data: &mut CudaSlice<u32>,
+        twiddles: &GpuNttTwiddles,
+    ) -> Vec<CudaSlice<u32>> {
+        if twiddles.width == 1 && twiddles.log_height >= 4 {
+            assert!(
+                twiddles.fused,
+                "preloaded NTT twiddle workspace kind mismatch"
+            );
+            self.dft_in_place_fused_with_twiddles(d_data, twiddles);
+        } else {
+            assert!(
+                !twiddles.fused,
+                "preloaded NTT twiddle workspace kind mismatch"
+            );
+            self.dft_in_place_per_layer_with_twiddles(d_data, twiddles);
+        }
+        Vec::new()
     }
 
     /// Fused DFT for width=1: process first FUSED_LOG layers in shared memory
@@ -244,6 +390,183 @@ impl GpuNtt {
         }
     }
 
+    fn dft_in_place_fused_guarded(
+        &self,
+        d_data: &mut CudaSlice<u32>,
+        root_table: &[Vec<u32>],
+        log_height: usize,
+    ) -> Vec<CudaSlice<u32>> {
+        let height = 1usize << log_height;
+        let threads = 256u32;
+        let fused = Self::FUSED_LOG.min(log_height);
+        let chunk_size = (1u32 << fused) as u32;
+
+        let mut guards = Vec::with_capacity((log_height - fused) + 2);
+        let mut all_twiddles: Vec<u32> = Vec::new();
+        let mut tw_offsets: Vec<u32> = Vec::new();
+        for k in 0..fused {
+            tw_offsets.push(all_twiddles.len() as u32);
+            let layer_idx = log_height - 1 - k;
+            all_twiddles.extend_from_slice(&root_table[layer_idx]);
+        }
+        tw_offsets.push(all_twiddles.len() as u32);
+
+        let d_tw = self.stream.memcpy_stod(&all_twiddles).unwrap();
+        let d_offsets = self.stream.memcpy_stod(&tw_offsets).unwrap();
+        let n_elements = height as u32;
+        let fused_u32 = fused as u32;
+        let n_chunks = (height as u32) / chunk_size;
+
+        {
+            let (data_ptr, _g1) = d_data.device_ptr_mut(&self.stream);
+            let (tw_ptr, _g2) = d_tw.device_ptr(&self.stream);
+            let (off_ptr, _g3) = d_offsets.device_ptr(&self.stream);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &data_ptr as *const _ as *mut _,
+                &tw_ptr as *const _ as *mut _,
+                &off_ptr as *const _ as *mut _,
+                &fused_u32 as *const _ as *mut _,
+                &chunk_size as *const _ as *mut _,
+                &n_elements as *const _ as *mut _,
+            ];
+            let smem_bytes = chunk_size * 4;
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_dft_fused,
+                    (n_chunks, 1, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("fused dft kernel failed");
+            }
+        }
+        guards.push(d_tw);
+        guards.push(d_offsets);
+
+        let remaining_layers = log_height - fused;
+        for k in 0..remaining_layers {
+            let layer_idx = remaining_layers - 1 - k;
+            let m = root_table[layer_idx].len() as u32;
+            let n_butterflies = (height / 2) as u32;
+            let d_tw = self.stream.memcpy_stod(&root_table[layer_idx]).unwrap();
+            let w = 1u32;
+
+            {
+                let (data_ptr, _g1) = d_data.device_ptr_mut(&self.stream);
+                let (tw_ptr, _g2) = d_tw.device_ptr(&self.stream);
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    &data_ptr as *const _ as *mut _,
+                    &tw_ptr as *const _ as *mut _,
+                    &m as *const _ as *mut _,
+                    &w as *const _ as *mut _,
+                    &n_butterflies as *const _ as *mut _,
+                ];
+                let blocks = (n_butterflies + threads - 1) / threads;
+                unsafe {
+                    cuda_result::launch_kernel(
+                        self.fn_dft_layer,
+                        (blocks, 1, 1),
+                        (threads, 1, 1),
+                        0,
+                        self.stream.cu_stream(),
+                        &mut args,
+                    )
+                    .expect("dft layer kernel failed");
+                }
+            }
+            guards.push(d_tw);
+        }
+
+        guards
+    }
+
+    fn dft_in_place_fused_with_twiddles(
+        &self,
+        d_data: &mut CudaSlice<u32>,
+        twiddles: &GpuNttTwiddles,
+    ) {
+        let log_height = twiddles.log_height;
+        let height = 1usize << log_height;
+        let threads = 256u32;
+        let fused = Self::FUSED_LOG.min(log_height);
+        let chunk_size = (1u32 << fused) as u32;
+        let n_elements = height as u32;
+        let fused_u32 = fused as u32;
+        let n_chunks = (height as u32) / chunk_size;
+
+        {
+            let d_tw = twiddles
+                .d_fused_twiddles
+                .as_ref()
+                .expect("missing preloaded fused NTT DFT twiddles");
+            let d_offsets = twiddles
+                .d_fused_offsets
+                .as_ref()
+                .expect("missing preloaded fused NTT DFT offsets");
+            let (data_ptr, _g1) = d_data.device_ptr_mut(&self.stream);
+            let (tw_ptr, _g2) = d_tw.device_ptr(&self.stream);
+            let (off_ptr, _g3) = d_offsets.device_ptr(&self.stream);
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &data_ptr as *const _ as *mut _,
+                &tw_ptr as *const _ as *mut _,
+                &off_ptr as *const _ as *mut _,
+                &fused_u32 as *const _ as *mut _,
+                &chunk_size as *const _ as *mut _,
+                &n_elements as *const _ as *mut _,
+            ];
+            let smem_bytes = chunk_size * 4;
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_dft_fused,
+                    (n_chunks, 1, 1),
+                    (threads, 1, 1),
+                    smem_bytes,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("fused dft kernel failed");
+            }
+        }
+
+        let remaining_layers = log_height - fused;
+        assert_eq!(
+            twiddles.d_layer_twiddles.len(),
+            remaining_layers,
+            "preloaded NTT DFT layer count mismatch"
+        );
+        for (k, d_tw) in twiddles.d_layer_twiddles.iter().enumerate() {
+            let layer_idx = remaining_layers - 1 - k;
+            let m = 1u32 << (log_height - 1 - layer_idx);
+            let n_butterflies = (height / 2) as u32;
+            let w = 1u32;
+            {
+                let (data_ptr, _g1) = d_data.device_ptr_mut(&self.stream);
+                let (tw_ptr, _g2) = d_tw.device_ptr(&self.stream);
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    &data_ptr as *const _ as *mut _,
+                    &tw_ptr as *const _ as *mut _,
+                    &m as *const _ as *mut _,
+                    &w as *const _ as *mut _,
+                    &n_butterflies as *const _ as *mut _,
+                ];
+                let blocks = (n_butterflies + threads - 1) / threads;
+                unsafe {
+                    cuda_result::launch_kernel(
+                        self.fn_dft_layer,
+                        (blocks, 1, 1),
+                        (threads, 1, 1),
+                        0,
+                        self.stream.cu_stream(),
+                        &mut args,
+                    )
+                    .expect("dft layer kernel failed");
+                }
+            }
+        }
+    }
+
     /// Per-layer DFT (original implementation, used for width>1).
     fn dft_in_place_per_layer(
         &self,
@@ -255,15 +578,19 @@ impl GpuNtt {
         let height = 1usize << log_height;
         let threads = 256u32;
 
-        for layer_idx in (0..log_height).rev() {
-            let m = root_table[layer_idx].len() as u32;
-            let n_butterflies = ((height / 2) * width) as u32;
+        // Upload all twiddle tables at once to avoid per-layer memcpy_stod.
+        let d_twiddles: Vec<CudaSlice<u32>> = root_table
+            .iter()
+            .map(|layer_tw| self.stream.memcpy_stod(layer_tw).unwrap())
+            .collect();
 
-            let d_tw = self.stream.memcpy_stod(&root_table[layer_idx]).unwrap();
+        for layer_idx in (0..log_height).rev() {
+            let m = d_twiddles[layer_idx].len() as u32;
+            let n_butterflies = ((height / 2) * width) as u32;
 
             {
                 let (data_ptr, _g1) = d_data.device_ptr_mut(&self.stream);
-                let (tw_ptr, _g2) = d_tw.device_ptr(&self.stream);
+                let (tw_ptr, _g2) = d_twiddles[layer_idx].device_ptr(&self.stream);
                 let w = width as u32;
 
                 let mut args: Vec<*mut std::ffi::c_void> = vec![
@@ -287,7 +614,99 @@ impl GpuNtt {
                     .expect("dft layer kernel failed");
                 }
             }
-            self.stream.synchronize().unwrap();
+            // No sync needed — kernels on the same stream execute in order.
+        }
+    }
+
+    fn dft_in_place_per_layer_guarded(
+        &self,
+        d_data: &mut CudaSlice<u32>,
+        root_table: &[Vec<u32>],
+        log_height: usize,
+        width: usize,
+    ) -> Vec<CudaSlice<u32>> {
+        let height = 1usize << log_height;
+        let threads = 256u32;
+        let mut guards = Vec::with_capacity(log_height);
+
+        for layer_idx in (0..log_height).rev() {
+            let m = root_table[layer_idx].len() as u32;
+            let n_butterflies = ((height / 2) * width) as u32;
+            let d_tw = self.stream.memcpy_stod(&root_table[layer_idx]).unwrap();
+
+            {
+                let (data_ptr, _g1) = d_data.device_ptr_mut(&self.stream);
+                let (tw_ptr, _g2) = d_tw.device_ptr(&self.stream);
+                let w = width as u32;
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    &data_ptr as *const _ as *mut _,
+                    &tw_ptr as *const _ as *mut _,
+                    &m as *const _ as *mut _,
+                    &w as *const _ as *mut _,
+                    &n_butterflies as *const _ as *mut _,
+                ];
+                let blocks = (n_butterflies + threads - 1) / threads;
+                unsafe {
+                    cuda_result::launch_kernel(
+                        self.fn_dft_layer,
+                        (blocks, 1, 1),
+                        (threads, 1, 1),
+                        0,
+                        self.stream.cu_stream(),
+                        &mut args,
+                    )
+                    .expect("dft layer kernel failed");
+                }
+            }
+            guards.push(d_tw);
+        }
+
+        guards
+    }
+
+    fn dft_in_place_per_layer_with_twiddles(
+        &self,
+        d_data: &mut CudaSlice<u32>,
+        twiddles: &GpuNttTwiddles,
+    ) {
+        let log_height = twiddles.log_height;
+        let width = twiddles.width;
+        let height = 1usize << log_height;
+        let threads = 256u32;
+        assert_eq!(
+            twiddles.d_layer_twiddles.len(),
+            log_height,
+            "preloaded NTT DFT layer count mismatch"
+        );
+
+        for (k, d_tw) in twiddles.d_layer_twiddles.iter().enumerate() {
+            let layer_idx = log_height - 1 - k;
+            let m = 1u32 << (log_height - 1 - layer_idx);
+            let n_butterflies = ((height / 2) * width) as u32;
+            {
+                let (data_ptr, _g1) = d_data.device_ptr_mut(&self.stream);
+                let (tw_ptr, _g2) = d_tw.device_ptr(&self.stream);
+                let w = width as u32;
+                let mut args: Vec<*mut std::ffi::c_void> = vec![
+                    &data_ptr as *const _ as *mut _,
+                    &tw_ptr as *const _ as *mut _,
+                    &m as *const _ as *mut _,
+                    &w as *const _ as *mut _,
+                    &n_butterflies as *const _ as *mut _,
+                ];
+                let blocks = (n_butterflies + threads - 1) / threads;
+                unsafe {
+                    cuda_result::launch_kernel(
+                        self.fn_dft_layer,
+                        (blocks, 1, 1),
+                        (threads, 1, 1),
+                        0,
+                        self.stream.cu_stream(),
+                        &mut args,
+                    )
+                    .expect("dft layer kernel failed");
+                }
+            }
         }
     }
 
@@ -487,13 +906,48 @@ impl GpuNtt {
         n_cols: u32,
         log_inv_rate: u32,
     ) -> CudaSlice<u32> {
+        let d_out = self.prepare_evals_for_fft_device_async(d_evals, n_evals, n_cols, log_inv_rate);
+        self.stream.synchronize().unwrap();
+        d_out
+    }
+
+    pub fn prepare_evals_for_fft_device_async(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        n_cols: u32,
+        log_inv_rate: u32,
+    ) -> CudaSlice<u32> {
+        let full_len = (n_evals as u64) << log_inv_rate;
+        let mut d_out = self.stream.alloc_zeros::<u32>(full_len as usize).unwrap();
+        self.prepare_evals_for_fft_device_into_async(
+            d_evals,
+            n_evals,
+            n_cols,
+            log_inv_rate,
+            &mut d_out,
+        );
+        d_out
+    }
+
+    pub fn prepare_evals_for_fft_device_into_async(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        n_cols: u32,
+        log_inv_rate: u32,
+        d_out: &mut CudaSlice<u32>,
+    ) {
         let n_blocks = n_cols;
         let full_len = (n_evals as u64) << log_inv_rate;
         let block_size = full_len / n_blocks as u64;
         let log_block_size = block_size.trailing_zeros();
         let out_len = (block_size as u32) * n_cols;
+        assert!(
+            d_out.len() >= out_len as usize,
+            "prepare_evals_for_fft_device_into_async output too small"
+        );
 
-        let mut d_out = self.stream.alloc_zeros::<u32>(out_len as usize).unwrap();
         {
             let (evals_ptr, _g1) = d_evals.device_ptr(&self.stream);
             let (out_ptr, _g2) = d_out.device_ptr_mut(&self.stream);
@@ -510,13 +964,112 @@ impl GpuNtt {
             ];
             unsafe {
                 cuda_result::launch_kernel(
-                    self.fn_prepare_evals, (blocks, 1, 1), (threads, 1, 1),
-                    0, self.stream.cu_stream(), &mut args,
-                ).expect("prepare_evals kernel failed");
+                    self.fn_prepare_evals,
+                    (blocks, 1, 1),
+                    (threads, 1, 1),
+                    0,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("prepare_evals kernel failed");
             }
         }
+    }
+
+    /// Reorder extension-field evaluations for the WHIR DFT convention, on GPU device.
+    /// The input buffer stores `n_evals` extension elements as contiguous `ext_dim` words.
+    /// The returned buffer is flattened to base-field words, ready for DFT with width
+    /// `n_cols * ext_dim`.
+    pub fn prepare_evals_for_fft_ext_device(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        n_cols: u32,
+        log_inv_rate: u32,
+        ext_dim: u32,
+    ) -> CudaSlice<u32> {
+        let d_out = self.prepare_evals_for_fft_ext_device_async(
+            d_evals,
+            n_evals,
+            n_cols,
+            log_inv_rate,
+            ext_dim,
+        );
         self.stream.synchronize().unwrap();
         d_out
+    }
+
+    pub fn prepare_evals_for_fft_ext_device_async(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        n_cols: u32,
+        log_inv_rate: u32,
+        ext_dim: u32,
+    ) -> CudaSlice<u32> {
+        let full_len = ((n_evals as u64) << log_inv_rate) as usize;
+        let mut d_out = self
+            .stream
+            .alloc_zeros::<u32>(full_len * ext_dim as usize)
+            .unwrap();
+        self.prepare_evals_for_fft_ext_device_into_async(
+            d_evals,
+            n_evals,
+            n_cols,
+            log_inv_rate,
+            ext_dim,
+            &mut d_out,
+        );
+        d_out
+    }
+
+    pub fn prepare_evals_for_fft_ext_device_into_async(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        n_cols: u32,
+        log_inv_rate: u32,
+        ext_dim: u32,
+        d_out: &mut CudaSlice<u32>,
+    ) {
+        let n_blocks = n_cols;
+        let full_len = (n_evals as u64) << log_inv_rate;
+        let block_size = full_len / n_blocks as u64;
+        let log_block_size = block_size.trailing_zeros();
+        let out_ext_len = (block_size as u32) * n_cols;
+        let out_len_words = (out_ext_len as usize) * (ext_dim as usize);
+        assert!(
+            d_out.len() >= out_len_words,
+            "prepare_evals_for_fft_ext_device_into_async output too small"
+        );
+
+        {
+            let (evals_ptr, _g1) = d_evals.device_ptr(&self.stream);
+            let (out_ptr, _g2) = d_out.device_ptr_mut(&self.stream);
+            let threads = 256u32;
+            let blocks = (out_ext_len + threads - 1) / threads;
+            let mut args: Vec<*mut std::ffi::c_void> = vec![
+                &evals_ptr as *const _ as *mut _,
+                &out_ptr as *const _ as *mut _,
+                &n_evals as *const _ as *mut _,
+                &n_cols as *const _ as *mut _,
+                &log_block_size as *const _ as *mut _,
+                &log_inv_rate as *const _ as *mut _,
+                &ext_dim as *const _ as *mut _,
+                &out_ext_len as *const _ as *mut _,
+            ];
+            unsafe {
+                cuda_result::launch_kernel(
+                    self.fn_prepare_evals_ext,
+                    (blocks, 1, 1),
+                    (threads, 1, 1),
+                    0,
+                    self.stream.cu_stream(),
+                    &mut args,
+                )
+                .expect("prepare_evals ext kernel failed");
+            }
+        }
     }
 
     /// Full reorder → DFT pipeline on device. Returns DFT output as device buffer.
@@ -528,9 +1081,9 @@ impl GpuNtt {
         log_inv_rate: usize,
     ) -> CudaSlice<u32> {
         let n_cols = 1u32 << folding_factor;
-        let mut d_reordered = self.prepare_evals_for_fft_device(
-            d_evals, n_evals, n_cols, log_inv_rate as u32,
-        );
+        // Use async prepare to avoid unnecessary stream sync before DFT.
+        let mut d_reordered =
+            self.prepare_evals_for_fft_device_async(d_evals, n_evals, n_cols, log_inv_rate as u32);
 
         // DFT on the reordered matrix (height = out_len / n_cols, width = n_cols).
         let full_len = (n_evals as u64) << log_inv_rate;
@@ -539,6 +1092,211 @@ impl GpuNtt {
         let root_table = build_root_table(log_height);
         self.dft_in_place(&mut d_reordered, &root_table, log_height, n_cols as usize);
         d_reordered
+    }
+
+    pub fn reorder_and_dft_device_guarded(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        folding_factor: usize,
+        log_inv_rate: usize,
+    ) -> GpuNttOutput {
+        let n_cols = 1u32 << folding_factor;
+        let mut d_reordered =
+            self.prepare_evals_for_fft_device_async(d_evals, n_evals, n_cols, log_inv_rate as u32);
+
+        let full_len = (n_evals as u64) << log_inv_rate;
+        let block_size = full_len / n_cols as u64;
+        let log_height = block_size.trailing_zeros() as usize;
+        let root_table = build_root_table(log_height);
+        let guards =
+            self.dft_in_place_guarded(&mut d_reordered, &root_table, log_height, n_cols as usize);
+        GpuNttOutput {
+            d_data: d_reordered,
+            _guards: guards,
+        }
+    }
+
+    pub fn reorder_and_dft_device_guarded_with_twiddles(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        folding_factor: usize,
+        log_inv_rate: usize,
+        twiddles: &GpuNttTwiddles,
+    ) -> GpuNttOutput {
+        let full_len = ((n_evals as u64) << log_inv_rate) as usize;
+        let d_reordered = self.stream.alloc_zeros::<u32>(full_len).unwrap();
+        self.reorder_and_dft_device_guarded_with_twiddles_into(
+            d_evals,
+            n_evals,
+            folding_factor,
+            log_inv_rate,
+            twiddles,
+            d_reordered,
+        )
+    }
+
+    pub fn reorder_and_dft_device_guarded_with_twiddles_into(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        folding_factor: usize,
+        log_inv_rate: usize,
+        twiddles: &GpuNttTwiddles,
+        mut d_reordered: CudaSlice<u32>,
+    ) -> GpuNttOutput {
+        let n_cols = 1u32 << folding_factor;
+        self.prepare_evals_for_fft_device_into_async(
+            d_evals,
+            n_evals,
+            n_cols,
+            log_inv_rate as u32,
+            &mut d_reordered,
+        );
+        let full_len = (n_evals as u64) << log_inv_rate;
+        let block_size = full_len / n_cols as u64;
+        let log_height = block_size.trailing_zeros() as usize;
+        assert_eq!(
+            twiddles.log_height, log_height,
+            "preloaded NTT DFT log-height mismatch"
+        );
+        assert_eq!(
+            twiddles.width, n_cols as usize,
+            "preloaded NTT DFT width mismatch"
+        );
+        let guards = self.dft_in_place_guarded_with_twiddles(&mut d_reordered, twiddles);
+        GpuNttOutput {
+            d_data: d_reordered,
+            _guards: guards,
+        }
+    }
+
+    /// Extension-field reorder -> DFT pipeline on device.
+    /// Input is `n_evals` extension elements laid out as contiguous `ext_dim` words.
+    /// Output is flattened base-field words with DFT width `n_cols * ext_dim`.
+    pub fn reorder_and_dft_ext_device(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        folding_factor: usize,
+        log_inv_rate: usize,
+        ext_dim: usize,
+    ) -> CudaSlice<u32> {
+        let n_cols = 1u32 << folding_factor;
+        // Use async prepare to avoid unnecessary stream sync before DFT.
+        let mut d_reordered = self.prepare_evals_for_fft_ext_device_async(
+            d_evals,
+            n_evals,
+            n_cols,
+            log_inv_rate as u32,
+            ext_dim as u32,
+        );
+
+        let full_len = (n_evals as u64) << log_inv_rate;
+        let block_size = full_len / n_cols as u64;
+        let log_height = block_size.trailing_zeros() as usize;
+        let root_table = build_root_table(log_height);
+        self.dft_in_place(
+            &mut d_reordered,
+            &root_table,
+            log_height,
+            (n_cols as usize) * ext_dim,
+        );
+        d_reordered
+    }
+
+    pub fn reorder_and_dft_ext_device_guarded(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        folding_factor: usize,
+        log_inv_rate: usize,
+        ext_dim: usize,
+    ) -> GpuNttOutput {
+        let n_cols = 1u32 << folding_factor;
+        let mut d_reordered = self.prepare_evals_for_fft_ext_device_async(
+            d_evals,
+            n_evals,
+            n_cols,
+            log_inv_rate as u32,
+            ext_dim as u32,
+        );
+
+        let full_len = (n_evals as u64) << log_inv_rate;
+        let block_size = full_len / n_cols as u64;
+        let log_height = block_size.trailing_zeros() as usize;
+        let root_table = build_root_table(log_height);
+        let guards = self.dft_in_place_guarded(
+            &mut d_reordered,
+            &root_table,
+            log_height,
+            (n_cols as usize) * ext_dim,
+        );
+        GpuNttOutput {
+            d_data: d_reordered,
+            _guards: guards,
+        }
+    }
+
+    pub fn reorder_and_dft_ext_device_guarded_with_twiddles(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        folding_factor: usize,
+        log_inv_rate: usize,
+        ext_dim: usize,
+        twiddles: &GpuNttTwiddles,
+    ) -> GpuNttOutput {
+        let full_len = ((n_evals as u64) << log_inv_rate) as usize;
+        let d_reordered = self.stream.alloc_zeros::<u32>(full_len * ext_dim).unwrap();
+        self.reorder_and_dft_ext_device_guarded_with_twiddles_into(
+            d_evals,
+            n_evals,
+            folding_factor,
+            log_inv_rate,
+            ext_dim,
+            twiddles,
+            d_reordered,
+        )
+    }
+
+    pub fn reorder_and_dft_ext_device_guarded_with_twiddles_into(
+        &self,
+        d_evals: &CudaSlice<u32>,
+        n_evals: u32,
+        folding_factor: usize,
+        log_inv_rate: usize,
+        ext_dim: usize,
+        twiddles: &GpuNttTwiddles,
+        mut d_reordered: CudaSlice<u32>,
+    ) -> GpuNttOutput {
+        let n_cols = 1u32 << folding_factor;
+        self.prepare_evals_for_fft_ext_device_into_async(
+            d_evals,
+            n_evals,
+            n_cols,
+            log_inv_rate as u32,
+            ext_dim as u32,
+            &mut d_reordered,
+        );
+        let full_len = (n_evals as u64) << log_inv_rate;
+        let block_size = full_len / n_cols as u64;
+        let log_height = block_size.trailing_zeros() as usize;
+        assert_eq!(
+            twiddles.log_height, log_height,
+            "preloaded NTT DFT log-height mismatch"
+        );
+        assert_eq!(
+            twiddles.width,
+            (n_cols as usize) * ext_dim,
+            "preloaded NTT DFT width mismatch"
+        );
+        let guards = self.dft_in_place_guarded_with_twiddles(&mut d_reordered, twiddles);
+        GpuNttOutput {
+            d_data: d_reordered,
+            _guards: guards,
+        }
     }
 
     pub fn stream(&self) -> &Arc<CudaStream> {

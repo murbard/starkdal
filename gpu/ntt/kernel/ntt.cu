@@ -233,6 +233,39 @@ extern "C" __global__ void prepare_evals_for_fft_kernel(
     out[i] = (src_index < n_evals) ? evals[src_index] : 0;
 }
 
+// Ext-field variant of prepare_evals_for_fft_kernel.
+// Input is `n_evals` extension elements, each stored as `ext_dim` contiguous u32s.
+// Output is a base-field row-major matrix with width = n_cols * ext_dim.
+extern "C" __global__ void prepare_evals_for_fft_ext_kernel(
+    const uint32_t* __restrict__ evals,
+    uint32_t* __restrict__ out,
+    uint32_t n_evals,
+    uint32_t n_cols,
+    uint32_t log_block_size,
+    uint32_t log_inv_rate,
+    uint32_t ext_dim,
+    uint32_t out_ext_len
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= out_ext_len) return;
+
+    uint32_t col = i % n_cols;
+    uint32_t row = i / n_cols;
+    uint32_t src_index = ((col << log_block_size) + row) >> log_inv_rate;
+    uint32_t out_off = i * ext_dim;
+
+    if (src_index < n_evals) {
+        uint32_t src_off = src_index * ext_dim;
+        for (uint32_t k = 0; k < ext_dim; k++) {
+            out[out_off + k] = evals[src_off + k];
+        }
+    } else {
+        for (uint32_t k = 0; k < ext_dim; k++) {
+            out[out_off + k] = 0;
+        }
+    }
+}
+
 // ── Inverse DFT layer (for round-trip testing) ──────────────────────────
 // Inverts the evals butterfly. Given:
 //   y_hi = x_hi + (x_lo - x_hi) * ω

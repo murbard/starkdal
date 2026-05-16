@@ -22,6 +22,17 @@ pub fn prove_execution(
     whir_config: &WhirConfigBuilder,
     vm_profiler: bool,
 ) -> Result<ExecutionProof, ProverError> {
+    #[cfg(feature = "gpu")]
+    {
+        return crate::gpu_prove_execution::gpu_prove_execution(
+            bytecode,
+            public_input,
+            witness,
+            whir_config,
+            vm_profiler,
+        );
+    }
+    #[cfg(not(feature = "gpu"))]
     check_rate(whir_config.starting_log_inv_rate)
         .map_err(|err| panic!("{err}"))
         .unwrap();

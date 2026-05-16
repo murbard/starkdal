@@ -28,9 +28,11 @@ fn generate_program(cp: &CircuitParams) -> String {
     }
     // Unrolled butterflies
     for s in 1..=cp.log_total {
-        let m = 1usize << s; let half = m >> 1;
+        let m = 1usize << s;
+        let half = m >> 1;
         let stride = cp.n_eval >> s;
-        let prev = (s - 1) * cp.n_eval; let curr = s * cp.n_eval;
+        let prev = (s - 1) * cp.n_eval;
+        let curr = s * cp.n_eval;
         for gi in 0..cp.n_eval / m {
             let gs = gi * m;
             for j in 0..half {
@@ -60,7 +62,11 @@ fn generate_program(cp: &CircuitParams) -> String {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let log_n: usize = args.iter().position(|a| a == "--log-n").map(|i| args[i+1].parse().unwrap()).unwrap_or(8);
+    let log_n: usize = args
+        .iter()
+        .position(|a| a == "--log-n")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(8);
     let log_blowup = 1usize;
     let cp = CircuitParams::new(log_n, log_blowup, pick_log_felts_per_leaf_kb(log_n + log_blowup));
     let coeffs: Vec<F> = (1..=cp.n as u32).map(F::from_u32).collect();
@@ -72,10 +78,13 @@ fn main() {
     hints.insert("twiddles".to_string(), vec![cp.twiddles.clone()]);
     let program = generate_program(&cp);
     let r = run_bench("FFT unrolled", &cp, program, &pi, hints, 1);
-    println!("{}", serde_json::json!({
-        "variant": "fft_unroll", "log_n": log_n,
-        "prove_s": (r.prove_time.as_secs_f64() * 1000.0).round() / 1000.0,
-        "cycles": r.metadata.cycles, "poseidons": r.metadata.n_poseidons,
-        "memory": r.metadata.memory, "peak_rss": r.peak_rss,
-    }));
+    println!(
+        "{}",
+        serde_json::json!({
+            "variant": "fft_unroll", "log_n": log_n,
+            "prove_s": (r.prove_time.as_secs_f64() * 1000.0).round() / 1000.0,
+            "cycles": r.metadata.cycles, "poseidons": r.metadata.n_poseidons,
+            "memory": r.metadata.memory, "peak_rss": r.peak_rss,
+        })
+    );
 }

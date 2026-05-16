@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use cudarc::driver::safe::CudaContext;
-use gpu_pow_grind::{GpuPowGrinder, cpu_field_ops, cpu_qe_ops, cpu_pow_grind};
+use gpu_pow_grind::{GpuPowGrinder, cpu_field_ops, cpu_pow_grind, cpu_qe_ops};
 use proptest::prelude::*;
 
 const P: u32 = 0x7F000001;
@@ -73,8 +73,12 @@ proptest! {
 fn test_quintic_ext_batch() {
     let (_stream, gpu) = gpu();
     let n = 200;
-    let a_flat: Vec<u32> = (0..n * 5).map(|i| ((i as u64 * 31 + 7) % P as u64) as u32).collect();
-    let b_flat: Vec<u32> = (0..n * 5).map(|i| ((i as u64 * 47 + 13) % P as u64) as u32).collect();
+    let a_flat: Vec<u32> = (0..n * 5)
+        .map(|i| ((i as u64 * 31 + 7) % P as u64) as u32)
+        .collect();
+    let b_flat: Vec<u32> = (0..n * 5)
+        .map(|i| ((i as u64 * 47 + 13) % P as u64) as u32)
+        .collect();
 
     let results = gpu.qe_test(&a_flat, &b_flat);
     for i in 0..n {
@@ -100,7 +104,8 @@ fn test_pow_grind_8bit() {
     let nonce_slot = 8u32;
     let target_bits = 8u32;
 
-    let gpu_nonce = gpu.grind(&state, nonce_slot, target_bits, 1 << 20)
+    let gpu_nonce = gpu
+        .grind(&state, nonce_slot, target_bits, 1 << 20)
         .expect("GPU should find 8-bit PoW within 1M attempts");
 
     let cpu_nonce = cpu_pow_grind(&state, nonce_slot as usize, target_bits);
@@ -113,10 +118,16 @@ fn test_pow_grind_8bit() {
     use koala_bear::symmetric::Permutation;
     let initial = check_state;
     p.permute_mut(&mut check_state);
-    for i in 0..16 { check_state[i] += initial[i]; }
+    for i in 0..16 {
+        check_state[i] += initial[i];
+    }
     let out0 = field::PrimeField32::as_canonical_u32(&check_state[0]);
     let mask = (1u32 << target_bits) - 1;
-    assert_eq!(out0 & mask, 0, "GPU nonce {gpu_nonce:#010x} does not satisfy {target_bits}-bit PoW");
+    assert_eq!(
+        out0 & mask,
+        0,
+        "GPU nonce {gpu_nonce:#010x} does not satisfy {target_bits}-bit PoW"
+    );
 }
 
 #[test]
@@ -127,7 +138,8 @@ fn test_pow_grind_16bit() {
     let nonce_slot = 8u32;
     let target_bits = 16u32;
 
-    let gpu_nonce = gpu.grind(&state, nonce_slot, target_bits, 1 << 22)
+    let gpu_nonce = gpu
+        .grind(&state, nonce_slot, target_bits, 1 << 22)
         .expect("GPU should find 16-bit PoW within 4M attempts");
 
     // Verify.
@@ -137,8 +149,14 @@ fn test_pow_grind_16bit() {
     use koala_bear::symmetric::Permutation;
     let initial = check_state;
     p.permute_mut(&mut check_state);
-    for i in 0..16 { check_state[i] += initial[i]; }
+    for i in 0..16 {
+        check_state[i] += initial[i];
+    }
     let out0 = field::PrimeField32::as_canonical_u32(&check_state[0]);
     let mask = (1u32 << target_bits) - 1;
-    assert_eq!(out0 & mask, 0, "GPU nonce does not satisfy {target_bits}-bit PoW");
+    assert_eq!(
+        out0 & mask,
+        0,
+        "GPU nonce does not satisfy {target_bits}-bit PoW"
+    );
 }

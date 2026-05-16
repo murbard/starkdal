@@ -5,31 +5,36 @@
 //!
 //! Usage: cargo run --release --example bench_recursive -- --log-n 22 --arity 8
 
-use rayon::prelude::*;
 use backend::{
-    Evaluation, MleGroupOwned, MultilinearPoint, VerifierState,
-    dot_product, eval_eq_packed_scaled, flatten_scalars_to_base,
-    sumcheck_prove, sumcheck_verify, ProductComputation, RawProof,
+    Evaluation, MleGroupOwned, MultilinearPoint, ProductComputation, RawProof, VerifierState, dot_product,
+    eval_eq_packed_scaled, flatten_scalars_to_base, sumcheck_prove, sumcheck_verify,
 };
+use lean_prover::SNARK_DOMAIN_SEP;
+use lean_vm::{DIGEST_LEN as VM_DIGEST_LEN, DIMENSION, EF, N_INSTRUCTION_COLUMNS};
+use rayon::prelude::*;
 use rec_aggregation::{
-    init_dal_aggregation_bytecode, get_dal_aggregation_bytecode,
-    extract_bytecode_claim_from_input_data, hash_bytecode_claims,
+    extract_bytecode_claim_from_input_data, get_dal_aggregation_bytecode, hash_bytecode_claims,
+    init_dal_aggregation_bytecode,
 };
 use starkdal_leanvm::*;
-use lean_prover::SNARK_DOMAIN_SEP;
-use lean_vm::{EF, DIMENSION, N_INSTRUCTION_COLUMNS, DIGEST_LEN as VM_DIGEST_LEN};
-use utils::{build_prover_state, get_poseidon16, poseidon16_compress_pair};
 use std::collections::HashMap;
 use std::time::Instant;
+use utils::{build_prover_state, get_poseidon16, poseidon16_compress_pair};
 
 const LEAF_LOG_N: usize = 12; // fixed leaf size: 4096 coefficients = 16 KB
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let log_n: usize = args.iter().position(|a| a == "--log-n")
-        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(22);
-    let arity: usize = args.iter().position(|a| a == "--arity")
-        .map(|i| args[i + 1].parse().unwrap()).unwrap_or(8);
+    let log_n: usize = args
+        .iter()
+        .position(|a| a == "--log-n")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(22);
+    let arity: usize = args
+        .iter()
+        .position(|a| a == "--arity")
+        .map(|i| args[i + 1].parse().unwrap())
+        .unwrap_or(8);
 
     let log_blowup = 1usize;
     let log_total = log_n + log_blowup;
@@ -37,7 +42,11 @@ fn main() {
     let cp = CircuitParams::new(log_n, log_blowup, lfpl);
 
     // Leaf parameters
-    let leaf_cp = CircuitParams::new(LEAF_LOG_N, log_blowup, pick_log_felts_per_leaf_kb(LEAF_LOG_N + log_blowup));
+    let leaf_cp = CircuitParams::new(
+        LEAF_LOG_N,
+        log_blowup,
+        pick_log_felts_per_leaf_kb(LEAF_LOG_N + log_blowup),
+    );
     let leaf_n_eval = leaf_cp.n_eval;
     let n_leaves = cp.n_eval / leaf_n_eval;
     let payload_mb = (cp.n * 4) as f64 / (1024.0 * 1024.0);
@@ -82,7 +91,11 @@ fn main() {
     let t0 = Instant::now();
     let leaf_program = generate_shared_leaf_program(&cp, &leaf_cp);
     let leaf_bytecode = compile_program(&ProgramSource::Raw(leaf_program.clone()));
-    eprintln!("    {:.3}s ({} lines)", t0.elapsed().as_secs_f64(), leaf_program.lines().count());
+    eprintln!(
+        "    {:.3}s ({} lines)",
+        t0.elapsed().as_secs_f64(),
+        leaf_program.lines().count()
+    );
 
     // Step 3: Compile aggregation bytecode
     eprintln!("[3] Compiling aggregation bytecode (arity={arity})...");
@@ -100,68 +113,80 @@ fn main() {
     let mut leaf_proofs = Vec::with_capacity(n_leaves);
     for batch_start in (0..n_leaves).step_by(concurrency) {
         let batch_end = (batch_start + concurrency).min(n_leaves);
-        let batch: Vec<_> = (batch_start..batch_end).into_par_iter().map(|ci| {
-            let offset = ci * leaf_n_eval;
-            let chunk_evals = evals[offset..offset + leaf_n_eval].to_vec();
+        let batch: Vec<_> = (batch_start..batch_end)
+            .into_par_iter()
+            .map(|ci| {
+                let offset = ci * leaf_n_eval;
+                let chunk_evals = evals[offset..offset + leaf_n_eval].to_vec();
 
-            // Compute subtree root and partial sums
-            let n_sub_leaves = leaf_n_eval / leaf_cp.fpl;
-            let mut layer: Vec<[F; 8]> = (0..n_sub_leaves)
-                .map(|i| poseidon_hash_chain(&chunk_evals[i * leaf_cp.fpl..(i + 1) * leaf_cp.fpl]))
-                .collect();
-            while layer.len() > 1 {
-                layer = (0..layer.len() / 2)
-                    .map(|i| poseidon_hash_pair(&layer[2 * i], &layer[2 * i + 1]))
+                // Compute subtree root and partial sums
+                let n_sub_leaves = leaf_n_eval / leaf_cp.fpl;
+                let mut layer: Vec<[F; 8]> = (0..n_sub_leaves)
+                    .map(|i| poseidon_hash_chain(&chunk_evals[i * leaf_cp.fpl..(i + 1) * leaf_cp.fpl]))
                     .collect();
-            }
-            let subtree_root = layer[0];
-
-            let x_start = cp.g * cp.omega.exp_u64(offset as u64);
-            let w_start = cp.g_1mn * cp.omega_1mn.exp_u64(offset as u64);
-            let sign_start = if offset % 2 == 0 { F::ONE } else { F::ZERO - F::ONE };
-
-            let partial_sums: Vec<F> = challenges.iter().map(|&beta| {
-                let beta_n = beta.exp_u64(cp.n as u64);
-                let mut x = x_start;
-                let mut w = w_start;
-                let mut sign = sign_start;
-                let mut s = F::ZERO;
-                for j in 0..leaf_n_eval {
-                    let yj_n_inv = F::ONE / (cp.g_n * sign);
-                    s += chunk_evals[j] * w * (beta_n * yj_n_inv - F::ONE) / (beta - x);
-                    x *= cp.omega;
-                    w *= cp.omega_1mn;
-                    sign = F::ZERO - sign;
+                while layer.len() > 1 {
+                    layer = (0..layer.len() / 2)
+                        .map(|i| poseidon_hash_pair(&layer[2 * i], &layer[2 * i + 1]))
+                        .collect();
                 }
-                s
-            }).collect();
+                let subtree_root = layer[0];
 
-            // Build leaf_data: [subtree_root(8), betas(4), sums(4), x_start, w_start, sign_start]
-            let mut leaf_data: Vec<F> = subtree_root.to_vec();
-            leaf_data.extend_from_slice(&challenges);
-            leaf_data.extend_from_slice(&partial_sums);
-            leaf_data.push(x_start);
-            leaf_data.push(w_start);
-            leaf_data.push(sign_start);
-            leaf_data.resize(24, F::ZERO); // pad to 24 (3 chunks of 8)
+                let x_start = cp.g * cp.omega.exp_u64(offset as u64);
+                let w_start = cp.g_1mn * cp.omega_1mn.exp_u64(offset as u64);
+                let sign_start = if offset % 2 == 0 { F::ONE } else { F::ZERO - F::ONE };
 
-            // PI = hash(leaf_data) = 8 FE
-            let pi_hash = hash_leaf_data(&leaf_data);
-            let mut pi = pi_hash.to_vec();
-            pi.resize(pi.len().next_power_of_two(), F::ZERO);
+                let partial_sums: Vec<F> = challenges
+                    .iter()
+                    .map(|&beta| {
+                        let beta_n = beta.exp_u64(cp.n as u64);
+                        let mut x = x_start;
+                        let mut w = w_start;
+                        let mut sign = sign_start;
+                        let mut s = F::ZERO;
+                        for j in 0..leaf_n_eval {
+                            let yj_n_inv = F::ONE / (cp.g_n * sign);
+                            s += chunk_evals[j] * w * (beta_n * yj_n_inv - F::ONE) / (beta - x);
+                            x *= cp.omega;
+                            w *= cp.omega_1mn;
+                            sign = F::ZERO - sign;
+                        }
+                        s
+                    })
+                    .collect();
 
-            let mut hints = HashMap::new();
-            hints.insert("leaf_data".to_string(), vec![leaf_data.clone()]);
-            hints.insert("evals_chunk".to_string(), vec![chunk_evals]);
+                // Build leaf_data: [subtree_root(8), betas(4), sums(4), x_start, w_start, sign_start]
+                let mut leaf_data: Vec<F> = subtree_root.to_vec();
+                leaf_data.extend_from_slice(&challenges);
+                leaf_data.extend_from_slice(&partial_sums);
+                leaf_data.push(x_start);
+                leaf_data.push(w_start);
+                leaf_data.push(sign_start);
+                leaf_data.resize(24, F::ZERO); // pad to 24 (3 chunks of 8)
 
-            let proof = prove_execution(
-                &leaf_bytecode, &pi,
-                &ExecutionWitness { preamble_memory_len: 0, hints },
-                &default_whir_config(1), false,
-            ).unwrap_or_else(|e| panic!("leaf {ci} failed: {e}"));
+                // PI = hash(leaf_data) = 8 FE
+                let pi_hash = hash_leaf_data(&leaf_data);
+                let mut pi = pi_hash.to_vec();
+                pi.resize(pi.len().next_power_of_two(), F::ZERO);
 
-            (proof, subtree_root, partial_sums, leaf_data)
-        }).collect();
+                let mut hints = HashMap::new();
+                hints.insert("leaf_data".to_string(), vec![leaf_data.clone()]);
+                hints.insert("evals_chunk".to_string(), vec![chunk_evals]);
+
+                let proof = prove_execution(
+                    &leaf_bytecode,
+                    &pi,
+                    &ExecutionWitness {
+                        preamble_memory_len: 0,
+                        hints,
+                    },
+                    &default_whir_config(1),
+                    false,
+                )
+                .unwrap_or_else(|e| panic!("leaf {ci} failed: {e}"));
+
+                (proof, subtree_root, partial_sums, leaf_data)
+            })
+            .collect();
         leaf_proofs.extend(batch);
     }
     let leaf_time = t0.elapsed();
@@ -181,15 +206,20 @@ fn main() {
     let agg_bytecode = get_dal_aggregation_bytecode();
 
     // Process leaf proofs in groups of `arity`
-    let mut current_proofs: Vec<_> = leaf_proofs.iter().map(|(p, sr, ps, ld)| {
-        (p.proof.clone(), *sr, ps.clone(), ld.clone())
-    }).collect();
+    let mut current_proofs: Vec<_> = leaf_proofs
+        .iter()
+        .map(|(p, sr, ps, ld)| (p.proof.clone(), *sr, ps.clone(), ld.clone()))
+        .collect();
 
     let mut agg_level = 0;
     while current_proofs.len() > 1 {
         agg_level += 1;
         let n_groups = (current_proofs.len() + arity - 1) / arity;
-        eprintln!("    Level {agg_level}: {} proofs → {} groups of {arity}", current_proofs.len(), n_groups);
+        eprintln!(
+            "    Level {agg_level}: {} proofs → {} groups of {arity}",
+            current_proofs.len(),
+            n_groups
+        );
 
         // Phase 1: Prepare all group hints (verify children, build hints) — sequential, fast
         let preamble_len = 61;
@@ -226,7 +256,8 @@ fn main() {
             input_data.push(F::from_u32(group.len() as u32));
             input_data.resize(DIGEST_LEN + 4 + 1 + bytecode_claim_size_padded, F::ZERO);
             // Write bytecode_claim_output (default for leaf level)
-            input_data[DIGEST_LEN + 4 + 1 + leaf_bytecode_point_n_vars * DIMENSION] = leaf_bytecode.instructions_multilinear[0];
+            input_data[DIGEST_LEN + 4 + 1 + leaf_bytecode_point_n_vars * DIMENSION] =
+                leaf_bytecode.instructions_multilinear[0];
             input_data.extend_from_slice(&bytecode_hash_domsep);
             input_data.resize(input_data.len().next_multiple_of(VM_DIGEST_LEN), F::ZERO);
 
@@ -243,17 +274,29 @@ fn main() {
             let mut agg_pi = agg_pi_hash.to_vec();
             agg_pi.resize(agg_pi.len().next_power_of_two(), F::ZERO);
 
-            let (merkle_leaf_blobs, merkle_path_blobs): (Vec<Vec<F>>, Vec<Vec<F>>) =
-                raw_proof.merkle_openings.iter().map(|o| {
-                    (o.leaf_data.clone(), o.path.iter().flat_map(|d| d.iter().copied()).collect())
-                }).unzip();
+            let (merkle_leaf_blobs, merkle_path_blobs): (Vec<Vec<F>>, Vec<Vec<F>>) = raw_proof
+                .merkle_openings
+                .iter()
+                .map(|o| {
+                    (
+                        o.leaf_data.clone(),
+                        o.path.iter().flat_map(|d| d.iter().copied()).collect(),
+                    )
+                })
+                .unzip();
 
             let mut hints: HashMap<String, Vec<Vec<F>>> = HashMap::new();
             hints.insert("input_data".to_string(), vec![input_data]);
             hints.insert("child_pi".to_string(), vec![leaf_data.clone()]);
             hints.insert("inner_bytecode_claim".to_string(), vec![inner_claim]);
-            hints.insert("bytecode_value_hint".to_string(), vec![details.bytecode_evaluation.value.as_basis_coefficients_slice().to_vec()]);
-            hints.insert("proof_transcript_size".to_string(), vec![vec![F::from_usize(raw_proof.transcript.len())]]);
+            hints.insert(
+                "bytecode_value_hint".to_string(),
+                vec![details.bytecode_evaluation.value.as_basis_coefficients_slice().to_vec()],
+            );
+            hints.insert(
+                "proof_transcript_size".to_string(),
+                vec![vec![F::from_usize(raw_proof.transcript.len())]],
+            );
             hints.insert("proof_transcript".to_string(), vec![raw_proof.transcript]);
             hints.insert("merkle_leaf".to_string(), merkle_leaf_blobs);
             hints.insert("merkle_path".to_string(), merkle_path_blobs);
@@ -266,17 +309,30 @@ fn main() {
         let mut agg_proofs = Vec::with_capacity(n_groups);
         for batch_start in (0..n_groups).step_by(concurrency) {
             let batch_end = (batch_start + concurrency).min(n_groups);
-            let batch: Vec<_> = (batch_start..batch_end).into_par_iter().map(|gi| {
-                prove_execution(
-                    agg_bytecode, &jobs[gi].pi,
-                    &ExecutionWitness { preamble_memory_len: preamble_len, hints: jobs[gi].hints.clone() },
-                    &default_whir_config(1), false,
-                ).unwrap_or_else(|e| panic!("agg group {gi} prove: {e}"))
-            }).collect();
+            let batch: Vec<_> = (batch_start..batch_end)
+                .into_par_iter()
+                .map(|gi| {
+                    prove_execution(
+                        agg_bytecode,
+                        &jobs[gi].pi,
+                        &ExecutionWitness {
+                            preamble_memory_len: preamble_len,
+                            hints: jobs[gi].hints.clone(),
+                        },
+                        &default_whir_config(1),
+                        false,
+                    )
+                    .unwrap_or_else(|e| panic!("agg group {gi} prove: {e}"))
+                })
+                .collect();
             agg_proofs.extend(batch);
         }
         let agg_cycles: usize = agg_proofs.iter().map(|p| p.metadata.cycles).sum();
-        eprintln!("    {} aggregation proofs, {} total cycles", agg_proofs.len(), agg_cycles);
+        eprintln!(
+            "    {} aggregation proofs, {} total cycles",
+            agg_proofs.len(),
+            agg_cycles
+        );
 
         break; // one level for now
     }
@@ -289,21 +345,30 @@ fn main() {
     eprintln!();
     eprintln!("------------------------------------------------------------");
     eprintln!("  Payload         : {:.1} MB", payload_mb);
-    eprintln!("  Leaf proofs     : {n_leaves} × {:.3}s = {:.3}s wall",
-        leaf_time.as_secs_f64() / n_leaves as f64, leaf_time.as_secs_f64());
-    eprintln!("  Aggregation     : {:.3}s (verify only, proving WIP)", agg_time.as_secs_f64());
+    eprintln!(
+        "  Leaf proofs     : {n_leaves} × {:.3}s = {:.3}s wall",
+        leaf_time.as_secs_f64() / n_leaves as f64,
+        leaf_time.as_secs_f64()
+    );
+    eprintln!(
+        "  Aggregation     : {:.3}s (verify only, proving WIP)",
+        agg_time.as_secs_f64()
+    );
     eprintln!("  Total           : {:.3}s", total_time);
     eprintln!("  Peak RSS        : {:.1} GB", peak_rss as f64 / (1u64 << 30) as f64);
     eprintln!("------------------------------------------------------------");
 
-    println!("{}", serde_json::json!({
-        "payload_mb": (payload_mb * 10.0).round() / 10.0,
-        "log_n": log_n, "arity": arity, "n_leaves": n_leaves,
-        "leaf_time_s": (leaf_time.as_secs_f64() * 1000.0).round() / 1000.0,
-        "agg_time_s": (agg_time.as_secs_f64() * 1000.0).round() / 1000.0,
-        "leaf_cycles": leaf_cycles,
-        "peak_rss": peak_rss,
-    }));
+    println!(
+        "{}",
+        serde_json::json!({
+            "payload_mb": (payload_mb * 10.0).round() / 10.0,
+            "log_n": log_n, "arity": arity, "n_leaves": n_leaves,
+            "leaf_time_s": (leaf_time.as_secs_f64() * 1000.0).round() / 1000.0,
+            "agg_time_s": (agg_time.as_secs_f64() * 1000.0).round() / 1000.0,
+            "leaf_cycles": leaf_cycles,
+            "peak_rss": peak_rss,
+        })
+    );
 }
 
 /// Generate a SHARED unrolled syndrome-check leaf program.
@@ -314,10 +379,7 @@ fn main() {
 /// constants OMEGA/OMEGA_1MN each step.
 ///
 /// Public input: hash(leaf_data) = 8 FE.
-fn generate_shared_leaf_program(
-    full_cp: &CircuitParams,
-    leaf_cp: &CircuitParams,
-) -> String {
+fn generate_shared_leaf_program(full_cp: &CircuitParams, leaf_cp: &CircuitParams) -> String {
     let chunk_size = leaf_cp.n_eval;
 
     let mut p = String::new();

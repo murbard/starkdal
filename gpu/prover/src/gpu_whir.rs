@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use cudarc::driver::safe::{CudaSlice, CudaStream};
 
-use gpu_sumcheck::GpuSumcheck;
 use gpu_poly_fold::GpuPolyFold;
+use gpu_sumcheck::GpuSumcheck;
 
 /// GPU-resident WHIR product sumcheck state.
 ///
