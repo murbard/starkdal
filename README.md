@@ -1,11 +1,10 @@
 # starkdal
 
-Experimental prototypes for Data Availability Layer (DAL) commitment schemes. Two fundamentally different approaches:
+Data Availability Layer (DAL) commitment schemes and GPU-accelerated STARK proving.
 
-1. **STARK-based**: prove RS encoding inside a zkVM (exact correctness, compact proof)
-2. **ZODA**: the encoding itself is the proof (zero overhead, high throughput)
-
-**This is a playground for benchmarking, not production code.**
+1. **GPU STARK Prover**: monolithic GPU implementation of the leanVM prover (1.6 MiB/s on A100)
+2. **STARK-based circuits**: prove RS encoding inside a zkVM (exact correctness, compact proof)
+3. **ZODA**: the encoding itself is the proof (zero overhead, high throughput)
 
 ## ZODA (`zoda/`)
 
@@ -58,9 +57,44 @@ The NTT runs at **1.9 GB/s** (concrete-ntt with NEON). The encode throughput is 
 
 The NTT expansion ratio is 6× (rate-1/2 row encoding × rate-1/2 column encoding × 1.5 for proof vector NTTs). At 1.9 GB/s NTT throughput, the theoretical peak is ~317 MB/s per machine — we achieve ~70% of that.
 
-## STARK-based (`leanvm/`)
+## GPU STARK Prover (`gpu/` + `lean-da/`)
+
+Full monolithic GPU implementation of the leanVM STARK prover. Everything between trace upload and proof download runs on GPU — no CPU orchestration of protocol rounds.
 
 Built on [leanEthereum/leanMultisig](https://github.com/leanEthereum/leanMultisig)'s minimal zkVM (WHIR + SuperSpartan, KoalaBear field, Poseidon16 precompile).
+
+| Crate | Role |
+|-------|------|
+| `gpu/poseidon16` | Poseidon16 compress (106M/s RTX 3060) |
+| `gpu/sumcheck` | AIR + product + GKR sumcheck (CUDA graph captured) |
+| `gpu/ntt` | Radix-2 NTT with fused shared-memory layers |
+| `gpu/merkle` | Leaf hash + binary tree reduction |
+| `gpu/poly_fold` | Multilinear polynomial folding |
+| `gpu/pow_grind` | Proof-of-work grinding |
+| `gpu/trace_ops` | Column manipulation utilities |
+
+### Benchmarks
+
+| Hardware | Workload | Throughput | vs CPU |
+|----------|----------|------------|--------|
+| RTX 3060 | lean-da 10 blobs | 812 KiB/s | 2.7x |
+| A100 80GB | lean-da 48 blobs | 1656 KiB/s | 2.0x |
+| A100 80GB | lean-da 56 blobs | 1448 KiB/s | 2.4x |
+| RTX 3060 | XMSS 780 sigs | 502 XMSS/s | 2.9x |
+
+```bash
+# Run lean-da with GPU
+cd lean-da && cargo run --release -p lean-da --features gpu -- --n-blobs 48
+
+# Deploy to cloud GPU and benchmark
+bash bench/deploy_and_bench.sh ubuntu@<host> ~/.ssh/key
+```
+
+See [GPU_PROVER_HANDOVER.md](GPU_PROVER_HANDOVER.md) for full architecture details.
+
+## STARK-based circuits (`leanvm/`)
+
+Built on [leanEthereum/leanMultisig](https://github.com/leanEthereum/leanMultisig)'s minimal zkVM.
 
 Three circuit strategies, numbered by progression:
 
